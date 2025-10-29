@@ -9,6 +9,7 @@ on:
 jobs:
   call_api:
     runs-on: ubuntu-latest
+
     steps:
       - name: Install jq (for JSON parsing)
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -22,27 +23,29 @@ jobs:
           BODY='{"test_value":42}'
           RES=""
 
-          # Try up to 5 times in case the API is cold-starting
+          echo "Calling API: $URL"
           for i in {1..5}; do
             RES=$(curl -sS -m 20 -X POST "$URL" \
               -H "Content-Type: application/json" \
               -d "$BODY" || true)
 
-            # If it looks like JSON, we're done
+            # stop retrying if response parses as JSON
             echo "$RES" | jq . >/dev/null 2>&1 && break
-            echo "Attempt $i did not return JSON (cold start?). Sleeping 5s…"
+            echo "Attempt $i did not return JSON (cold start?). Sleeping 5s..."
             sleep 5
           done
 
           echo "Response (first 200 chars):"
           echo "$RES" | head -c 200; echo
 
-          # ✅ Write the entire JSON to GITHUB_OUTPUT safely (multi-line friendly)
+          # ✅ safely export multi-line JSON to GitHub outputs
           {
             echo 'res<<EOF'
             echo "$RES"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
+        outputs:
+          res: ${{ steps.call.outputs.res }}
 
       - name: Prepare email (parse + compose)
         id: prep
@@ -57,7 +60,6 @@ jobs:
           GUID=$(echo "$JSON" | jq -r '.guidance // empty')
           FEAT=$(echo "$JSON" | jq -c '.features // empty')
 
-          # Safe fallbacks so email is never blank
           [ -z "$MODEL" ] && MODEL="UNKNOWN"
           [ -z "$CONF" ] && CONF="0.0"
           [ -z "$GUID" ] && GUID="No guidance"
@@ -68,7 +70,6 @@ jobs:
           echo "Guidance: $GUID"
           echo "Features: $FEAT"
 
-          # Outputs for the mail step
           echo "subject=SPY Pre-Open: $MODEL (conf $CONF)" >> "$GITHUB_OUTPUT"
           printf "body<<EOF\nDirection: %s\nConfidence: %s\nGuidance: %s\nFeatures: %s\nTime: %s\nEOF\n" \
             "$MODEL" "$CONF" "$GUID" "$FEAT" "${{ github.run_started_at }}" >> "$GITHUB_OUTPUT"
