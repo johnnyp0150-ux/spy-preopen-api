@@ -21,19 +21,27 @@ jobs:
           URL="https://spy-preopen-api.onrender.com/predict"
           BODY='{"test_value":42}'
 
-          # Try up to 5 times in case the API is cold-starting
+          # Warm up the service in case Render is cold-starting
+          curl -sS -m 8 https://spy-preopen-api.onrender.com/ >/dev/null || true
+
+          # Try up to 5 times in case the API is still waking up
+          RES=""
           for i in {1..5}; do
-            RES=$(curl -sS -m 20 -X POST "$URL" \
+            echo "Attempt $i..."
+            RES=$(curl -sS -m 25 -X POST "$URL" \
+              -H "Accept: application/json" \
               -H "Content-Type: application/json" \
               -d "$BODY" || true)
 
             # If it looks like JSON, we're done
             echo "$RES" | jq . >/dev/null 2>&1 && break
-            echo "Attempt $i returned non-JSON (cold start?). Retrying in 5s…"
+
+            echo "Attempt $i did not return JSON. Sleeping 5s…"
             sleep 5
           done
 
-          echo "Response: $RES"
+          echo "Response (first 200 chars):"
+          echo "$RES" | head -c 200; echo
           echo "res=$RES" >> "$GITHUB_OUTPUT"
 
       - name: Prepare email (parse + compose)
@@ -60,7 +68,6 @@ jobs:
           echo "Guidance: $GUID"
           echo "Features: $FEAT"
 
-          # Outputs for the next step
           echo "subject=SPY Pre-Open: $MODEL (conf $CONF)" >> $GITHUB_OUTPUT
           printf "body<<EOF\nDirection: %s\nConfidence: %s\nGuidance: %s\nFeatures: %s\nTime: %s\nEOF\n" \
             "$MODEL" "$CONF" "$GUID" "$FEAT" "${{ github.run_started_at }}" >> $GITHUB_OUTPUT
