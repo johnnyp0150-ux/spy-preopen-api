@@ -9,27 +9,46 @@ jobs:
   call_api:
     runs-on: ubuntu-latest
     steps:
-      - name: Call SPY API
+      - name: Install jq (for JSON parsing)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Call SPY API (with retries)
         id: call
+        shell: bash
         run: |
-          RES=$(curl -sS -X POST https://spy-preopen-api.onrender.com/predict \
-            -H "Content-Type: application/json" \
-            -d '{"test_value":42}')
+          set -e
+          URL="https://spy-preopen-api.onrender.com/predict"
+          BODY='{"test_value":42}'
+
+          # Try up to 5 times in case the API is cold-starting
+          for i in {1..5}; do
+            RES=$(curl -sS -m 20 -X POST "$URL" \
+              -H "Content-Type: application/json" \
+              -d "$BODY" || true)
+
+            # Break if the response looks like JSON
+            echo "$RES" | jq . >/dev/null 2>&1 && break
+            echo "Attempt $i returned non-JSON (cold start?). Retrying in 5s…"
+            sleep 5
+          done
+
           echo "Response: $RES"
-          echo "res=$RES" >> $GITHUB_OUTPUT
+          echo "res=$RES" >> "$GITHUB_OUTPUT"
 
       - name: Parse values
         id: parse
+        shell: bash
         run: |
           JSON='${{ steps.call.outputs.res }}'
-          MODEL=$(jq -r '.model_call' <<< "$JSON")
-          CONF=$(jq -r '.confidence' <<< "$JSON")
-          GUID=$(jq -r '.guidance' <<< "$JSON")
-          FEAT=$(jq -c '.features' <<< "$JSON")
-          echo "model=$MODEL" >> $GITHUB_OUTPUT
-          echo "confidence=$CONF" >> $GITHUB_OUTPUT
-          echo "guidance=$GUID" >> $GITHUB_OUTPUT
-          echo "features=$FEAT" >> $GITHUB_OUTPUT
+          MODEL=$(echo "$JSON" | jq -r '.model_call // "UNKNOWN"')
+          CONF=$(echo "$JSON" | jq -r '.confidence // "0.0"')
+          GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance (API error?)"')
+          FEAT=$(echo "$JSON" | jq -c '.features // {}')
+
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "confidence=$CONF" >> "$GITHUB_OUTPUT"
+          echo "guidance=$GUID" >> "$GITHUB_OUTPUT"
+          echo "features=$FEAT" >> "$GITHUB_OUTPUT"
 
       - name: Email me the prediction
         uses: dawidd6/action-send-mail@v3
@@ -39,8 +58,7 @@ jobs:
           secure: true
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "SPY Pre-Open: ${{ steps.parse.outputs.model }} (conf ${{
-            steps.parse.outputs.confidence }})"
+          subject: "SPY Pre-Open: ${{ steps.parse.outputs.model }} (conf ${{ steps.parse.outputs.confidence }})"
           to: ${{ secrets.MAIL_USERNAME }}
           from: "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
           body: |
