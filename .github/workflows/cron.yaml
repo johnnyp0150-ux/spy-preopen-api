@@ -27,7 +27,7 @@ jobs:
               -H "Content-Type: application/json" \
               -d "$BODY" || true)
 
-            # Break if the response looks like JSON
+            # If it looks like JSON, we're done
             echo "$RES" | jq . >/dev/null 2>&1 && break
             echo "Attempt $i returned non-JSON (cold start?). Retrying in 5s…"
             sleep 5
@@ -36,47 +36,34 @@ jobs:
           echo "Response: $RES"
           echo "res=$RES" >> "$GITHUB_OUTPUT"
 
-      - name: Parse values
-        id: parse
+      - name: Prepare email (parse + compose)
+        id: prep
         shell: bash
         run: |
           JSON='${{ steps.call.outputs.res }}'
           echo "Raw JSON:"
           echo "$JSON"
 
-          MODEL=$(echo "$JSON" | jq -r '.model_call // "UNKNOWN"')
-          CONF=$(echo "$JSON" | jq -r '.confidence // "0.0"')
-          GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance"')
-          FEAT=$(echo "$JSON" | jq -c '.features // {}')
+          MODEL=$(echo "$JSON" | jq -r '.model_call // empty')
+          CONF=$(echo "$JSON" | jq -r '.confidence // empty')
+          GUID=$(echo "$JSON" | jq -r '.guidance // empty')
+          FEAT=$(echo "$JSON" | jq -c '.features // empty')
 
-          echo "model=$MODEL"     >> "$GITHUB_OUTPUT"
-          echo "confidence=$CONF" >> "$GITHUB_OUTPUT"
-          echo "guidance=$GUID"   >> "$GITHUB_OUTPUT"
-          echo "features=$FEAT"   >> "$GITHUB_OUTPUT"
+          # Safe fallbacks so email is never blank
+          [ -z "$MODEL" ] && MODEL="UNKNOWN"
+          [ -z "$CONF" ] && CONF="0.0"
+          [ -z "$GUID" ] && GUID="No guidance"
+          [ -z "$FEAT" ] && FEAT="{}"
 
-      - name: Compose email text
-        id: compose
-        shell: bash
-        run: |
-          # Debug to logs so you can see values resolve
-          echo "Model:      ${{ steps.parse.outputs.model }}"
-          echo "Confidence: ${{ steps.parse.outputs.confidence }}"
-          echo "Guidance:   ${{ steps.parse.outputs.guidance }}"
-          echo "Features:   ${{ steps.parse.outputs.features }}"
+          echo "Model: $MODEL"
+          echo "Confidence: $CONF"
+          echo "Guidance: $GUID"
+          echo "Features: $FEAT"
 
-          # Subject (single line)
-          echo "subject=SPY Pre-Open: ${{ steps.parse.outputs.model }} (conf ${{ steps.parse.outputs.confidence }})" >> "$GITHUB_OUTPUT"
-
-          # Body (multi-line)
-          {
-            echo "body<<EOF"
-            echo "Direction: ${{ steps.parse.outputs.model }}"
-            echo "Confidence: ${{ steps.parse.outputs.confidence }}"
-            echo "Guidance: ${{ steps.parse.outputs.guidance }}"
-            echo "Features: ${{ steps.parse.outputs.features }}"
-            echo "Time: ${{ github.event.repository.updated_at }}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          # Outputs for the next step
+          echo "subject=SPY Pre-Open: $MODEL (conf $CONF)" >> $GITHUB_OUTPUT
+          printf "body<<EOF\nDirection: %s\nConfidence: %s\nGuidance: %s\nFeatures: %s\nTime: %s\nEOF\n" \
+            "$MODEL" "$CONF" "$GUID" "$FEAT" "${{ github.run_started_at }}" >> $GITHUB_OUTPUT
 
       - name: Email me the prediction
         uses: dawidd6/action-send-mail@v3
@@ -86,7 +73,7 @@ jobs:
           secure: true
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          to:       ${{ secrets.MAIL_USERNAME }}
-          from:     "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
-          subject:  ${{ steps.compose.outputs.subject }}
-          body:     ${{ steps.compose.outputs.body }}
+          to: ${{ secrets.MAIL_USERNAME }}
+          from: "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
+          subject: ${{ steps.prep.outputs.subject }}
+          body: ${{ steps.prep.outputs.body }}
