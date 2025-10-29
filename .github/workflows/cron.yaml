@@ -10,9 +10,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Call SPY API
+        id: call
         run: |
           RES=$(curl -sS -X POST https://spy-preopen-api.onrender.com/predict \
             -H "Content-Type: application/json" \
             -d '{"test_value":42}')
-          echo "Response:"
-          echo "$RES"
+          echo "Response: $RES"
+          echo "res=$RES" >> $GITHUB_OUTPUT
+
+      - name: Parse values
+        id: parse
+        run: |
+          JSON='${{ steps.call.outputs.res }}'
+          MODEL=$(jq -r '.model_call' <<< "$JSON")
+          CONF=$(jq -r '.confidence' <<< "$JSON")
+          GUID=$(jq -r '.guidance' <<< "$JSON")
+          FEAT=$(jq -c '.features' <<< "$JSON")
+          echo "model=$MODEL" >> $GITHUB_OUTPUT
+          echo "confidence=$CONF" >> $GITHUB_OUTPUT
+          echo "guidance=$GUID" >> $GITHUB_OUTPUT
+          echo "features=$FEAT" >> $GITHUB_OUTPUT
+
+      - name: Email me the prediction
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "SPY Pre-Open: ${{ steps.parse.outputs.model }} (conf ${{
+            steps.parse.outputs.confidence }})"
+          to: ${{ secrets.MAIL_USERNAME }}
+          from: "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
+          body: |
+            Direction: ${{ steps.parse.outputs.model }}
+            Confidence: ${{ steps.parse.outputs.confidence }}
+            Guidance: ${{ steps.parse.outputs.guidance }}
+            Features: ${{ steps.parse.outputs.features }}
+            Time: ${{ github.event.repository.updated_at }}
