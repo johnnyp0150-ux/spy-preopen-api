@@ -35,20 +35,23 @@ jobs:
           echo "Response: $RES"
           echo "res=$RES" >> "$GITHUB_OUTPUT"
 
-      - name: Parse values
+            - name: Parse values
         id: parse
         shell: bash
         run: |
-          JSON='${{ steps.call.outputs.res }}'
+          JSON="${{ steps.call.outputs.res }}"
+          echo "Raw JSON:"
+          echo "$JSON"
+
           MODEL=$(echo "$JSON" | jq -r '.model_call // "UNKNOWN"')
           CONF=$(echo "$JSON" | jq -r '.confidence // "0.0"')
-          GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance (API error?)"')
+          GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance"')
           FEAT=$(echo "$JSON" | jq -c '.features // {}')
 
-          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
-          echo "confidence=$CONF" >> "$GITHUB_OUTPUT"
-          echo "guidance=$GUID" >> "$GITHUB_OUTPUT"
-          echo "features=$FEAT" >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL" >> $GITHUB_OUTPUT
+          echo "confidence=$CONF" >> $GITHUB_OUTPUT
+          echo "guidance=$GUID" >> $GITHUB_OUTPUT
+          echo "features=$FEAT" >> $GITHUB_OUTPUT
 
       - name: Email me the prediction
         uses: dawidd6/action-send-mail@v3
