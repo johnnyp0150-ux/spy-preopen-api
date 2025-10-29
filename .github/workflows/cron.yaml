@@ -20,15 +20,15 @@ jobs:
           set -e
           URL="https://spy-preopen-api.onrender.com/predict"
           BODY='{"test_value":42}'
+          RES=""
 
           # Try up to 5 times in case the API is cold-starting
-          RES=""
           for i in {1..5}; do
             RES=$(curl -sS -m 20 -X POST "$URL" \
               -H "Content-Type: application/json" \
               -d "$BODY" || true)
 
-            # If it looks like JSON, stop retrying
+            # If it looks like JSON, we're done
             echo "$RES" | jq . >/dev/null 2>&1 && break
             echo "Attempt $i did not return JSON (cold start?). Sleeping 5s…"
             sleep 5
@@ -37,18 +37,12 @@ jobs:
           echo "Response (first 200 chars):"
           echo "$RES" | head -c 200; echo
 
-          # Prefer single-line JSON in outputs (safer for GITHUB_OUTPUT)
-          if echo "$RES" | jq -c . >/dev/null 2>&1; then
-            MINIFIED="$(echo "$RES" | jq -c .)"
-            echo "res=$MINIFIED" >> "$GITHUB_OUTPUT"
-          else
-            # Fallback: heredoc (in case endpoint ever returns pretty JSON)
-            {
-              echo 'res<<EOF'
-              echo "$RES"
-              echo 'EOF'
-            } >> "$GITHUB_OUTPUT"
-          fi
+          # ✅ Write the entire JSON to GITHUB_OUTPUT safely (multi-line friendly)
+          {
+            echo 'res<<EOF'
+            echo "$RES"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare email (parse + compose)
         id: prep
