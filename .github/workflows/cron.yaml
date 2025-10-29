@@ -18,18 +18,19 @@ jobs:
         id: call
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           URL="https://spy-preopen-api.onrender.com/predict"
           BODY='{"test_value":42}'
           RES=""
 
-          echo "Calling API: $URL"
+          # Try up to 5 times (Render cold start protection)
           for i in {1..5}; do
-            RES=$(curl -sS -m 20 -X POST "$URL" \
-              -H "Content-Type: application/json" \
-              -d "$BODY" || true)
+            RES="$(curl -sS -m 20 -X POST "$URL" \
+                    -H "Content-Type: application/json" \
+                    -d "$BODY" || true)"
 
-            # stop retrying if response parses as JSON
+            # Stop retrying if it parses as JSON
             echo "$RES" | jq . >/dev/null 2>&1 && break
             echo "Attempt $i did not return JSON (cold start?). Sleeping 5s..."
             sleep 5
@@ -38,14 +39,13 @@ jobs:
           echo "Response (first 200 chars):"
           echo "$RES" | head -c 200; echo
 
-          # ✅ safely export multi-line JSON to GitHub outputs
-          {
-            echo 'res<<EOF'
-            echo "$RES"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
-        outputs:
-          res: ${{ steps.call.outputs.res }}
+          # Save a minified JSON into this step's output
+          if echo "$RES" | jq -e . >/dev/null 2>&1; then
+            echo "res=$(echo "$RES" | jq -c .)" >> "$GITHUB_OUTPUT"
+          else
+            # If not JSON, still pass something downstream so email isn't blank
+            echo 'res={"model_call":"UNKNOWN","confidence":0.0,"guidance":"No guidance","features":{}}' >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Prepare email (parse + compose)
         id: prep
@@ -60,6 +60,7 @@ jobs:
           GUID=$(echo "$JSON" | jq -r '.guidance // empty')
           FEAT=$(echo "$JSON" | jq -c '.features // empty')
 
+          # Fallbacks so the email never arrives blank
           [ -z "$MODEL" ] && MODEL="UNKNOWN"
           [ -z "$CONF" ] && CONF="0.0"
           [ -z "$GUID" ] && GUID="No guidance"
