@@ -2,7 +2,8 @@ name: SPY Preopen Trigger
 
 on:
   schedule:
-    - cron: '25 13 * * 1-5'   # 6:25 AM PT during DST (switch to 25 14 after clocks fall back)
+    # 6:25 AM PT during DST (switch to 25 14 after clocks fall back)
+    - cron: '25 13 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -35,11 +36,11 @@ jobs:
           echo "Response: $RES"
           echo "res=$RES" >> "$GITHUB_OUTPUT"
 
-            - name: Parse values
+      - name: Parse values
         id: parse
         shell: bash
         run: |
-          JSON="${{ steps.call.outputs.res }}"
+          JSON='${{ steps.call.outputs.res }}'
           echo "Raw JSON:"
           echo "$JSON"
 
@@ -48,10 +49,10 @@ jobs:
           GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance"')
           FEAT=$(echo "$JSON" | jq -c '.features // {}')
 
-          echo "model=$MODEL" >> $GITHUB_OUTPUT
-          echo "confidence=$CONF" >> $GITHUB_OUTPUT
-          echo "guidance=$GUID" >> $GITHUB_OUTPUT
-          echo "features=$FEAT" >> $GITHUB_OUTPUT
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "confidence=$CONF" >> "$GITHUB_OUTPUT"
+          echo "guidance=$GUID" >> "$GITHUB_OUTPUT"
+          echo "features=$FEAT" >> "$GITHUB_OUTPUT"
 
       - name: Email me the prediction
         uses: dawidd6/action-send-mail@v3
