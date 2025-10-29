@@ -49,10 +49,34 @@ jobs:
           GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance"')
           FEAT=$(echo "$JSON" | jq -c '.features // {}')
 
-          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL"     >> "$GITHUB_OUTPUT"
           echo "confidence=$CONF" >> "$GITHUB_OUTPUT"
-          echo "guidance=$GUID" >> "$GITHUB_OUTPUT"
-          echo "features=$FEAT" >> "$GITHUB_OUTPUT"
+          echo "guidance=$GUID"   >> "$GITHUB_OUTPUT"
+          echo "features=$FEAT"   >> "$GITHUB_OUTPUT"
+
+      - name: Compose email text
+        id: compose
+        shell: bash
+        run: |
+          # Debug to logs so you can see values resolve
+          echo "Model:      ${{ steps.parse.outputs.model }}"
+          echo "Confidence: ${{ steps.parse.outputs.confidence }}"
+          echo "Guidance:   ${{ steps.parse.outputs.guidance }}"
+          echo "Features:   ${{ steps.parse.outputs.features }}"
+
+          # Subject (single line)
+          echo "subject=SPY Pre-Open: ${{ steps.parse.outputs.model }} (conf ${{ steps.parse.outputs.confidence }})" >> "$GITHUB_OUTPUT"
+
+          # Body (multi-line)
+          {
+            echo "body<<EOF"
+            echo "Direction: ${{ steps.parse.outputs.model }}"
+            echo "Confidence: ${{ steps.parse.outputs.confidence }}"
+            echo "Guidance: ${{ steps.parse.outputs.guidance }}"
+            echo "Features: ${{ steps.parse.outputs.features }}"
+            echo "Time: ${{ github.event.repository.updated_at }}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Email me the prediction
         uses: dawidd6/action-send-mail@v3
@@ -62,12 +86,7 @@ jobs:
           secure: true
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "SPY Pre-Open: ${{ steps.parse.outputs.model }} (conf ${{ steps.parse.outputs.confidence }})"
-          to: ${{ secrets.MAIL_USERNAME }}
-          from: "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
-          body: |
-            Direction: ${{ steps.parse.outputs.model }}
-            Confidence: ${{ steps.parse.outputs.confidence }}
-            Guidance: ${{ steps.parse.outputs.guidance }}
-            Features: ${{ steps.parse.outputs.features }}
-            Time: ${{ github.event.repository.updated_at }}
+          to:       ${{ secrets.MAIL_USERNAME }}
+          from:     "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
+          subject:  ${{ steps.compose.outputs.subject }}
+          body:     ${{ steps.compose.outputs.body }}
