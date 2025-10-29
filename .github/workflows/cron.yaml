@@ -1,0 +1,18 @@
+name: SPY Preopen Trigger
+
+on:
+  schedule:
+    - cron: '25 13 * * 1-5'   # 6:25 AM PT during DST (switch to 25 14 after clocks fall back)
+  workflow_dispatch:
+
+jobs:
+  call_api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call SPY API
+        run: |
+          RES=$(curl -sS -X POST https://spy-preopen-api.onrender.com/predict \
+            -H "Content-Type: application/json" \
+            -d '{"test_value":42}')
+          echo "Response:"
+          echo "$RES"
