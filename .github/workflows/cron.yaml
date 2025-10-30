@@ -9,7 +9,6 @@ on:
 jobs:
   call_api:
     runs-on: ubuntu-latest
-
     steps:
       - name: Install jq (for JSON parsing)
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -18,34 +17,37 @@ jobs:
         id: call
         shell: bash
         run: |
-          set -euo pipefail
-
+          set -e
           URL="https://spy-preopen-api.onrender.com/predict"
-          BODY="{\"test_value\":42}"
+          BODY='{"test_value":42}'
           RES=""
 
-          # Try up to 5 times (Render cold start protection)
+          echo "Pinging API (up to 5 tries)..."
           for i in {1..5}; do
             RES="$(curl -sS -m 20 -X POST "$URL" \
-                    -H "Content-Type: application/json" \
-                    -d "$BODY" || true)"
+              -H 'Accept: application/json' \
+              -H 'Content-Type: application/json' \
+              -d "$BODY" || true)"
 
-            # Stop retrying if it parses as JSON
-            echo "$RES" | jq . >/dev/null 2>&1 && break
-            echo "Attempt $i did not return JSON (cold start?). Sleeping 5s..."
-            sleep 5
+            echo "Attempt $i — first 200 chars:"
+            echo "$RES" | head -c 200; echo
+
+            # break on valid JSON
+            echo "$RES" | jq -e . >/dev/null 2>&1 && break
+
+            # otherwise wait and retry
+            [ $i -lt 5 ] && echo "Not JSON yet (likely cold start). Sleeping 5s..." && sleep 5
           done
 
-          echo "Response (first 200 chars):"
-          echo "$RES" | head -c 200; echo
-
-          # Save a minified JSON into this step's output
-          if echo "$RES" | jq -e . >/dev/null 2>&1; then
-            echo "res=$(echo "$RES" | jq -c .)" >> "$GITHUB_OUTPUT"
-          else
-            # If not JSON, still pass something downstream so email isn't blank
-            echo 'res={"model_call":"UNKNOWN","confidence":0.0,"guidance":"No guidance","features":{}}' >> "$GITHUB_OUTPUT"
+          # If still not JSON after retries, fail clearly
+          if ! echo "$RES" | jq -e . >/dev/null 2>&1; then
+            echo "::error title=API did not return JSON::See the 'Attempt ... first 200 chars' log above (likely 5xx/cold-start HTML)."
+            exit 1
           fi
+
+          # ✅ write a single-line JSON to step output
+          MINIFIED="$(echo "$RES" | jq -c .)"
+          echo "res=$MINIFIED" >> "$GITHUB_OUTPUT"
 
       - name: Prepare email (parse + compose)
         id: prep
@@ -60,7 +62,7 @@ jobs:
           GUID=$(echo "$JSON" | jq -r '.guidance // empty')
           FEAT=$(echo "$JSON" | jq -c '.features // empty')
 
-          # Fallbacks so the email never arrives blank
+          # Safe fallbacks so email is never blank (shouldn't be used if call step succeeded)
           [ -z "$MODEL" ] && MODEL="UNKNOWN"
           [ -z "$CONF" ] && CONF="0.0"
           [ -z "$GUID" ] && GUID="No guidance"
