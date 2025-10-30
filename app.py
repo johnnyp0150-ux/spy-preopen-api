@@ -30,6 +30,17 @@ class PredictIn(BaseModel):
     # keep body optional so you can POST {} from phone
     test_value: Optional[int] = None
 
+# ---------- NEW: ultra-light health check ----------
+@app.get("/healthz")
+def healthz():
+    """Lightweight liveness probe (no external calls)."""
+    return {
+        "status": "ok",
+        "uptime_seconds": round(time.time() - APP_STARTED_AT, 2),
+        "version": "0.1.0",
+    }
+# --------------------------------------------------
+
 def latest_trade(symbol: str) -> float:
     url = f"{TRADE_BASE}/stocks/{symbol}/trades/latest"
     r = requests.get(url, headers=HDR, timeout=20)
@@ -86,7 +97,7 @@ def train_quick(df: pd.DataFrame):
 
 @app.get("/")
 def root():
-    return {"ok": True, "msg": "See /docs for interactive API."}
+    return {"ok": True, "msg": "See /docs for interactive API. Health: /healthz"}
 
 @app.post("/predict")
 def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
