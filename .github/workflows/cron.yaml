@@ -21,7 +21,7 @@ jobs:
           set -euo pipefail
 
           URL="https://spy-preopen-api.onrender.com/predict"
-          BODY='{"test_value":42}'
+          BODY="{\"test_value\":42}"
           RES=""
 
           # Try up to 5 times (Render cold start protection)
