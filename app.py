@@ -1,16 +1,19 @@
 # app.py
 import os, time, json
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+from fastapi import FastAPI, HTTPException, Header
+
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import GradientBoostingClassifier
 
+# -------------------- Config & Globals --------------------
 APP_STARTED_AT = time.time()
+
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 API_TOKEN         = os.getenv("API_TOKEN", "")  # optional bearer check
@@ -21,41 +24,92 @@ HDR = {
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
 }
 
+# Same thresholds as your notebook
 UP_THR   =  0.0035
 DOWN_THR = -0.0035
 
+# Simple in-memory cache to avoid re-downloading/retraining every request
+_HIST_DF: Optional[pd.DataFrame] = None
+_HIST_TS: float = 0.0
+_CLF = None
+_FEAT_NAMES = None
+_MODEL_TS: float = 0.0
+
+# Rebuild after this many seconds (12 hours)
+REFRESH_SECS = 12 * 3600
+
 app = FastAPI(title="SPY Preopen API", version="0.1.0")
 
+
+# -------------------- Schemas --------------------
+from pydantic import BaseModel
 class PredictIn(BaseModel):
     # keep body optional so you can POST {} from phone
     test_value: Optional[int] = None
 
-# ---------- NEW: ultra-light health check ----------
+
+# -------------------- Health --------------------
 @app.get("/healthz")
 def healthz():
-    """Lightweight liveness probe (no external calls)."""
+    """Lightweight liveness/readiness probe (no external calls)."""
     return {
         "status": "ok",
         "uptime_seconds": round(time.time() - APP_STARTED_AT, 2),
+        "model_cached": _CLF is not None,
+        "history_cached": _HIST_DF is not None,
         "version": "0.1.0",
     }
-# --------------------------------------------------
+
+@app.get("/health")
+def health():
+    return healthz()
+
+
+# -------------------- Data helpers --------------------
+def _need_refresh(ts: float) -> bool:
+    return (time.time() - ts) > REFRESH_SECS
+
 
 def latest_trade(symbol: str) -> float:
-    url = f"{TRADE_BASE}/stocks/{symbol}/trades/latest"
-    r = requests.get(url, headers=HDR, timeout=20)
-    r.raise_for_status()
-    return float(r.json()["trade"]["p"])
+    """
+    Live last trade:
+      • Use Alpaca if keys are present
+      • Fallback to yfinance intraday if not
+    """
+    if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+        url = f"{TRADE_BASE}/stocks/{symbol}/trades/latest"
+        r = requests.get(url, headers=HDR, timeout=20)
+        if r.status_code == 401:
+            # credentials present but invalid
+            raise HTTPException(502, "Alpaca auth failed (check keys)")
+        r.raise_for_status()
+        return float(r.json()["trade"]["p"])
+
+    # Fallback: yfinance 1m bars for the current day
+    t = yf.Ticker(symbol)
+    df = t.history(period="1d", interval="1m")
+    if df.empty:
+        raise HTTPException(502, f"Could not fetch intraday for {symbol} via yfinance.")
+    return float(df["Close"].iloc[-1])
+
 
 def prev_close(symbol: str) -> float:
-    # Get the most recent daily close (yesterday) using yfinance
+    """Yesterday close via yfinance (robust & free)."""
     df = yf.download(symbol, period="5d", auto_adjust=False, progress=False)
-    if df.empty:
-        raise RuntimeError("Could not fetch history from yfinance.")
+    if df.empty or len(df) < 2:
+        raise HTTPException(502, f"Could not fetch recent history for {symbol}.")
     return float(df["Close"].iloc[-2])
 
+
 def build_history() -> pd.DataFrame:
-    # Same columns as your notebook’s “Build a clean dataframe” cell
+    """
+    Same features you used in the notebook.
+    Cached in memory to avoid re-downloading on every request.
+    """
+    global _HIST_DF, _HIST_TS
+    if _HIST_DF is not None and not _need_refresh(_HIST_TS):
+        return _HIST_DF
+
     spy = yf.download("SPY", start="2012-01-01", auto_adjust=False, progress=False)
     vix = yf.download("VIXY", start="2012-01-01", auto_adjust=False, progress=False)
     es  = yf.download("ES=F", start="2012-01-01", auto_adjust=False, progress=False)
@@ -67,37 +121,51 @@ def build_history() -> pd.DataFrame:
     df["VIX_Close"] = vix["Close"].reindex(df.index).ffill()
     df["ES_Close"]  = es["Close"].reindex(df.index).ffill()
 
-    # Proxies used in your backtest
+    # Features from the backtest
     df["ES_overnight_ret"]  = df["ES_Close"].pct_change()
     df["VIX_overnight_ret"] = df["VIX_Close"].pct_change()
     df["Premarket_Gap"]     = (df["Open"] - df["Close"].shift(1)) / df["Close"].shift(1)
 
-    # Label same as your thresholds
+    # Labels using thresholds
     oc_ret = (df["Close"] / df["Close"].shift(1)) - 1.0
     lab = np.where(oc_ret >= UP_THR, "Up",
           np.where(oc_ret <= DOWN_THR, "Down", "Sideways"))
     df["label"] = lab
 
-    # Drop first rows with NaN features
     df = df.dropna(subset=["ES_overnight_ret","VIX_overnight_ret","Premarket_Gap"])
+
+    _HIST_DF = df
+    _HIST_TS = time.time()
     return df
 
+
 def train_quick(df: pd.DataFrame):
+    """Train a simple GBC like in your notebook (cached)."""
+    global _CLF, _FEAT_NAMES, _MODEL_TS
+    if _CLF is not None and _FEAT_NAMES is not None and not _need_refresh(_MODEL_TS):
+        return _CLF, _FEAT_NAMES
+
     X = df[["ES_overnight_ret", "VIX_overnight_ret", "Premarket_Gap"]].copy()
     y = df["label"].copy()
 
-    # Simple walk-forward split (same pattern as notebook)
     tscv = TimeSeriesSplit(n_splits=6)
     last_clf = None
     for tr, te in tscv.split(X):
         Xtr, ytr = X.iloc[tr], y.iloc[tr]
         last_clf = GradientBoostingClassifier(random_state=42)
         last_clf.fit(Xtr, ytr)
-    return last_clf, X.columns.tolist()
 
+    _CLF = last_clf
+    _FEAT_NAMES = X.columns.tolist()
+    _MODEL_TS = time.time()
+    return _CLF, _FEAT_NAMES
+
+
+# -------------------- Routes --------------------
 @app.get("/")
 def root():
     return {"ok": True, "msg": "See /docs for interactive API. Health: /healthz"}
+
 
 @app.post("/predict")
 def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
@@ -109,6 +177,7 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
             raise HTTPException(403, "Invalid token")
 
     try:
+        # Cache-aware history + model
         df_hist = build_history()
         clf, feat_names = train_quick(df_hist)
 
@@ -134,12 +203,15 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
         pred = conf_series.index[0]
         p = float(conf_series.iloc[0])
 
-        # Guidance like the notebook
-        guidance = ("OK: Meets confidence & not Sideways."
-                    if pred != "Sideways" and p >= 0.60
-                    else ("Guardrail: Sideways day predicted. Consider standing down."
-                          if pred == "Sideways"
-                          else "Guardrail: low confidence. Consider NOT trading."))
+        guidance = (
+            "OK: Meets confidence & not Sideways."
+            if pred != "Sideways" and p >= 0.60
+            else (
+                "Guardrail: Sideways day predicted. Consider standing down."
+                if pred == "Sideways"
+                else "Guardrail: low confidence. Consider NOT trading."
+            )
+        )
 
         return {
             "model_call": pred,
@@ -153,5 +225,9 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
             "cold_start_seconds": round(time.time() - APP_STARTED_AT, 2),
             "echo": payload.dict()
         }
+
+    except HTTPException:
+        raise
     except Exception as e:
+        # surface a clean error instead of HTML
         raise HTTPException(status_code=500, detail=str(e))
