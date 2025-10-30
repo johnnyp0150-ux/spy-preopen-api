@@ -1,12 +1,13 @@
 # app.py
-import os, time, json
-from typing import Optional, Tuple
+import os, time
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
 
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import GradientBoostingClassifier
@@ -24,11 +25,11 @@ HDR = {
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
 }
 
-# Same thresholds as your notebook
+# Thresholds (same as notebook)
 UP_THR   =  0.0035
 DOWN_THR = -0.0035
 
-# Simple in-memory cache to avoid re-downloading/retraining every request
+# In-memory cache
 _HIST_DF: Optional[pd.DataFrame] = None
 _HIST_TS: float = 0.0
 _CLF = None
@@ -38,11 +39,14 @@ _MODEL_TS: float = 0.0
 # Rebuild after this many seconds (12 hours)
 REFRESH_SECS = 12 * 3600
 
-app = FastAPI(title="SPY Preopen API", version="0.1.0")
+# Flags to expose whether we used a fallback path
+_LAST_HISTORY_FALLBACK = False
+_LAST_MODEL_FALLBACK = False
+
+app = FastAPI(title="SPY Preopen API", version="0.2.0")
 
 
 # -------------------- Schemas --------------------
-from pydantic import BaseModel
 class PredictIn(BaseModel):
     # keep body optional so you can POST {} from phone
     test_value: Optional[int] = None
@@ -57,7 +61,7 @@ def healthz():
         "uptime_seconds": round(time.time() - APP_STARTED_AT, 2),
         "model_cached": _CLF is not None,
         "history_cached": _HIST_DF is not None,
-        "version": "0.1.0",
+        "version": "0.2.0",
     }
 
 @app.get("/health")
@@ -65,7 +69,7 @@ def health():
     return healthz()
 
 
-# -------------------- Data helpers --------------------
+# -------------------- Helpers --------------------
 def _need_refresh(ts: float) -> bool:
     return (time.time() - ts) > REFRESH_SECS
 
@@ -80,7 +84,6 @@ def latest_trade(symbol: str) -> float:
         url = f"{TRADE_BASE}/stocks/{symbol}/trades/latest"
         r = requests.get(url, headers=HDR, timeout=20)
         if r.status_code == 401:
-            # credentials present but invalid
             raise HTTPException(502, "Alpaca auth failed (check keys)")
         r.raise_for_status()
         return float(r.json()["trade"]["p"])
@@ -103,61 +106,112 @@ def prev_close(symbol: str) -> float:
 
 def build_history() -> pd.DataFrame:
     """
-    Same features you used in the notebook.
-    Cached in memory to avoid re-downloading on every request.
+    Build the historical feature/label frame used for training.
+    Falls back to a tiny synthetic frame if downloads are empty so the API never 500s.
+    Caches the result for REFRESH_SECS.
     """
-    global _HIST_DF, _HIST_TS
+    global _HIST_DF, _HIST_TS, _LAST_HISTORY_FALLBACK
+    _LAST_HISTORY_FALLBACK = False
+
     if _HIST_DF is not None and not _need_refresh(_HIST_TS):
         return _HIST_DF
 
     spy = yf.download("SPY", start="2012-01-01", auto_adjust=False, progress=False)
     vix = yf.download("VIXY", start="2012-01-01", auto_adjust=False, progress=False)
-    es  = yf.download("ES=F", start="2012-01-01", auto_adjust=False, progress=False)
+    es  = yf.download("ES=F",  start="2012-01-01", auto_adjust=False, progress=False)
 
-    spy = spy.rename(columns=str.title)
-    df = pd.DataFrame(index=spy.index)
-    df["Open"]      = spy["Open"]
-    df["Close"]     = spy["Close"]
-    df["VIX_Close"] = vix["Close"].reindex(df.index).ffill()
-    df["ES_Close"]  = es["Close"].reindex(df.index).ffill()
+    if spy.empty or vix.empty or es.empty:
+        # Minimal synthetic two-row frame (enough for the dummy fallback model)
+        now = pd.Timestamp.utcnow().floor("D")
+        df = pd.DataFrame(
+            {
+                "Open":       [500.0, 501.0],
+                "Close":      [501.0, 502.0],
+                "VIX_Close":  [15.0,  15.1],
+                "ES_Close":   [5200.0, 5205.0],
+            },
+            index=[now - pd.Timedelta(days=1), now],
+        )
+        _LAST_HISTORY_FALLBACK = True
+    else:
+        spy = spy.rename(columns=str.title)
+        df = pd.DataFrame(index=spy.index)
+        df["Open"]      = spy["Open"]
+        df["Close"]     = spy["Close"]
+        df["VIX_Close"] = vix["Close"].reindex(df.index).ffill()
+        df["ES_Close"]  = es["Close"].reindex(df.index).ffill()
 
-    # Features from the backtest
+    # Features used in your notebook
     df["ES_overnight_ret"]  = df["ES_Close"].pct_change()
     df["VIX_overnight_ret"] = df["VIX_Close"].pct_change()
     df["Premarket_Gap"]     = (df["Open"] - df["Close"].shift(1)) / df["Close"].shift(1)
 
-    # Labels using thresholds
+    # Labels (Up / Down / Sideways) from thresholds
     oc_ret = (df["Close"] / df["Close"].shift(1)) - 1.0
     lab = np.where(oc_ret >= UP_THR, "Up",
           np.where(oc_ret <= DOWN_THR, "Down", "Sideways"))
     df["label"] = lab
 
-    df = df.dropna(subset=["ES_overnight_ret","VIX_overnight_ret","Premarket_Gap"])
+    df = df.dropna(subset=["ES_overnight_ret", "VIX_overnight_ret", "Premarket_Gap"])
 
-    _HIST_DF = df
-    _HIST_TS = time.time()
+    # If real data dropped everything (can happen), keep a tiny synthetic fallback
+    if df.empty:
+        now = pd.Timestamp.utcnow().floor("D")
+        df = pd.DataFrame(
+            {
+                "Open":              [500.0, 501.0],
+                "Close":             [501.0, 502.0],
+                "VIX_Close":         [15.0,  15.1],
+                "ES_Close":          [5200.0, 5205.0],
+                "ES_overnight_ret":  [0.0,  (5205.0/5200.0 - 1.0)],
+                "VIX_overnight_ret": [0.0,  (15.1/15.0 - 1.0)],
+                "Premarket_Gap":     [0.0,  (501.0/501.0 - 1.0)],
+                "label":             ["Sideways", "Sideways"],
+            },
+            index=[now - pd.Timedelta(days=1), now],
+        )
+        _LAST_HISTORY_FALLBACK = True
+
+    _HIST_DF, _HIST_TS = df, time.time()
     return df
 
 
 def train_quick(df: pd.DataFrame):
-    """Train a simple GBC like in your notebook (cached)."""
-    global _CLF, _FEAT_NAMES, _MODEL_TS
+    """
+    Train a GradientBoostingClassifier like the notebook.
+    Falls back to a DummyClassifier when history is tiny.
+    Caches the model for REFRESH_SECS.
+    """
+    global _CLF, _FEAT_NAMES, _MODEL_TS, _LAST_MODEL_FALLBACK
+    _LAST_MODEL_FALLBACK = False
+
     if _CLF is not None and _FEAT_NAMES is not None and not _need_refresh(_MODEL_TS):
         return _CLF, _FEAT_NAMES
 
     X = df[["ES_overnight_ret", "VIX_overnight_ret", "Premarket_Gap"]].copy()
     y = df["label"].copy()
 
-    tscv = TimeSeriesSplit(n_splits=6)
+    # If we have very few rows, use a safe dummy model
+    if len(X) < 3:
+        from sklearn.dummy import DummyClassifier
+        dummy = DummyClassifier(strategy="most_frequent")
+        # Fit on a single fake row just to satisfy scikit-learn's API
+        dummy.fit(np.zeros((1, 3)), ["Sideways"])
+        _CLF, _FEAT_NAMES, _MODEL_TS = dummy, X.columns.tolist(), time.time()
+        _LAST_MODEL_FALLBACK = True
+        return _CLF, _FEAT_NAMES
+
+    # Ensure n_splits < n_samples to avoid the “folds > samples” error
+    n_splits = max(2, min(6, len(X) - 1))
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
     last_clf = None
     for tr, te in tscv.split(X):
         Xtr, ytr = X.iloc[tr], y.iloc[tr]
         last_clf = GradientBoostingClassifier(random_state=42)
         last_clf.fit(Xtr, ytr)
 
-    _CLF = last_clf
-    _FEAT_NAMES = X.columns.tolist()
-    _MODEL_TS = time.time()
+    _CLF, _FEAT_NAMES, _MODEL_TS = last_clf, X.columns.tolist(), time.time()
     return _CLF, _FEAT_NAMES
 
 
@@ -189,7 +243,7 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
 
         premarket_gap  = (spy_last / spy_yday) - 1.0
         vix_overnight  = (vixy_last / vixy_yday) - 1.0
-        es_overnight   = df_hist["ES_overnight_ret"].iloc[-1]  # keep proxy same as notebook
+        es_overnight   = df_hist["ES_overnight_ret"].iloc[-1]  # proxy same as notebook
 
         x_live = pd.DataFrame([{
             "ES_overnight_ret":  es_overnight,
@@ -213,6 +267,12 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
             )
         )
 
+        # Indicate whether fallback paths were used
+        mode = {
+            "history_fallback": _LAST_HISTORY_FALLBACK,
+            "model_fallback": _LAST_MODEL_FALLBACK,
+        }
+
         return {
             "model_call": pred,
             "confidence": round(p, 4),
@@ -222,6 +282,7 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
                 "es_overnight_ret": round(float(es_overnight), 6),
             },
             "guidance": guidance,
+            "mode": mode,
             "cold_start_seconds": round(time.time() - APP_STARTED_AT, 2),
             "echo": payload.dict()
         }
