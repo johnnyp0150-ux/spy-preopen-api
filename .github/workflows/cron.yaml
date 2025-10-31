@@ -2,8 +2,9 @@ name: SPY Preopen Trigger
 
 on:
   schedule:
-    # 6:20 AM Pacific (DST). Change to '20 14 * * 1-5' after clocks fall back.
-    - cron: '20 13 * * 1-5'
+    # 6:23 AM Pacific DURING Daylight Saving Time (UTC-7)
+    # After clocks fall back (Standard Time, UTC-8), change '23 13' -> '23 14'
+    - cron: '23 13 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -11,23 +12,38 @@ jobs:
     runs-on: ubuntu-latest
     env:
       API_URL: https://spy-preopen-api.onrender.com/predict
+      HEALTH_URL: https://spy-preopen-api.onrender.com/healthz
+
       # --- policy knobs ---
-      MIN_CONF: "0.60"
-      ALLOW_SIDEWAYS: "false"
-      # --- optional trade webhook (leave empty if unused) ---
-      TRADE_WEBHOOK_URL: ${{ secrets.TRADE_WEBHOOK_URL }}
-      # --- Alpaca paper-trading ---
+      MIN_CONF: "0.60"          # require >= 0.60 confidence
+      ALLOW_SIDEWAYS: "false"   # don't trade if Sideways
+
+      # --- optional: Alpaca paper order (equities) ---
+      # set to 'true' to enable this simple proof-of-trade step
+      ENABLE_ALPACA_EQUITY_TRADE: "false"
       ALPACA_BASE: https://paper-api.alpaca.markets
-      ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
-      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
 
     steps:
       - name: Install jq (JSON)
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Warm API (healthz)
+      # --- NEW: warm Render so cold start doesn't delay email ---
+      - name: Warm Render app
+        id: warm
+        shell: bash
         run: |
-          curl -sS -m 10 https://spy-preopen-api.onrender.com/healthz || true
+          set -euo pipefail
+          echo "Warming $HEALTH_URL ..."
+          for i in {1..6}; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
+            echo "Attempt $i -> HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "warm_ok=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "warm_ok=false" >> "$GITHUB_OUTPUT"
 
       - name: Call SPY API (with retries)
         id: call
@@ -35,15 +51,20 @@ jobs:
         run: |
           set -euo pipefail
           echo "Pinging $API_URL ..."
+
           RES=""
           for i in {1..5}; do
             RES=$(curl -sS -m 25 -X POST "$API_URL" -H "Content-Type: application/json" -d '{}') || true
             if echo "$RES" | jq -e 'has("model_call") and has("confidence")' >/dev/null 2>&1; then
               break
             fi
-            echo "Attempt $i not JSON. Sleeping 6s…"
+            echo "Attempt $i not JSON (or missing fields). Sleeping 6s…"
             sleep 6
           done
+
+          echo "First 200 chars:"
+          echo "$RES" | head -c 200; echo
+
           JSON_MIN=$(echo "$RES" | jq -c . 2>/dev/null || echo '')
           if [ -z "$JSON_MIN" ]; then
             echo "JSON_MIN empty; failing fast."
@@ -56,6 +77,8 @@ jobs:
         shell: bash
         run: |
           JSON='${{ steps.call.outputs.res }}'
+          echo "Raw JSON:"; echo "$JSON" | jq .
+
           MODEL=$(echo "$JSON" | jq -r '.model_call // "UNKNOWN"')
           CONF=$(echo "$JSON" | jq -r '.confidence // 0')
           GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance"')
@@ -97,26 +120,26 @@ jobs:
           subject: ${{ steps.prep.outputs.subject }}
           body: ${{ steps.prep.outputs.body }}
 
-      - name: Place Alpaca paper trade (if policy passes)
-        if: ${{ steps.prep.outputs.should_trade == 'true' && env.ALPACA_KEY_ID != '' && env.ALPACA_SECRET_KEY != '' }}
+      # --- OPTIONAL: simple proof-of-trade via Alpaca equities ---
+      # This is intentionally basic (1 share of SPY) to verify end-to-end.
+      # We'll switch to OPTIONS next once the flow is confirmed.
+      - name: (Optional) Place Alpaca paper trade (equity)
+        if: ${{ steps.prep.outputs.should_trade == 'true' && env.ENABLE_ALPACA_EQUITY_TRADE == 'true' }}
         shell: bash
+        env:
+          APCA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          APCA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
-          JSON='${{ steps.call.outputs.res }}'
-          MODEL=$(echo "$JSON" | jq -r '.model_call')
-          if [ "$MODEL" = "Up" ]; then
-            echo "Placing paper BUY 1 SPY (market) via Alpaca…"
-            curl -sS -X POST "$ALPACA_BASE/v2/orders" \
-              -H "APCA-API-KEY-ID: $ALPACA_KEY_ID" \
-              -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" \
-              -H "Content-Type: application/json" \
-              -d '{"symbol":"SPY","qty":"1","side":"buy","type":"market","time_in_force":"day"}' | jq .
-          elif [ "$MODEL" = "Down" ]; then
-            echo "Placing paper SELL 1 SPY (market) via Alpaca…"
-            curl -sS -X POST "$ALPACA_BASE/v2/orders" \
-              -H "APCA-API-KEY-ID: $ALPACA_KEY_ID" \
-              -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" \
-              -H "Content-Type: application/json" \
-              -d '{"symbol":"SPY","qty":"1","side":"sell","type":"market","time_in_force":"day"}' | jq .
-          else
-            echo "Model=$MODEL not actionable."
-          fi
+          set -euo pipefail
+          MODEL='${{ steps.prep.outputs.model }}'
+          SIDE="buy"
+          if [ "$MODEL" = "Down" ]; then SIDE="sell"; fi
+
+          echo "Placing $SIDE 1 share SPY (paper)..."
+          curl -sS -X POST "$ALPACA_BASE/v2/orders" \
+            -H "APCA-API-KEY-ID: $APCA_KEY_ID" \
+            -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg sym SPY --arg side "$SIDE" \
+                  '{symbol:$sym, qty:"1", side:$side, type:"market", time_in_force:"day"}')" \
+            | sed -e 's/./&/200' -e 'q'
