@@ -1,339 +1,95 @@
-name: SPY Preopen Trigger (OPTIONS Auto-Trade)
+name: SPY Preopen Trigger
 
 on:
   schedule:
-    # 6:23 AM Pacific DURING DST (UTC-7)
+    # 6:23 AM Pacific DURING Daylight Saving Time (UTC-7)
     # After clocks fall back (UTC-8), change '23 13' -> '23 14'
     - cron: '23 13 * * 1-5'
   workflow_dispatch:
 
 jobs:
-  preopen_and_trade_options:
+  call_api:
     runs-on: ubuntu-latest
     env:
       API_URL: https://spy-preopen-api.onrender.com/predict
       HEALTH_URL: https://spy-preopen-api.onrender.com/healthz
 
-      # ---- Model policy knobs ----
-      MIN_CONF: "0.60"          # require >= 0.60 confidence
-      ALLOW_SIDEWAYS: "false"   # don't trade if Sideways
+      # --- policy knobs ---
+      MIN_CONF: "0.60"            # require >= 0.60 confidence
+      ALLOW_SIDEWAYS: "false"     # don't trade if Sideways
+      REQUIRE_REGIME_PASS: "true" # use regime gates from API
 
-      # ---- Alpaca endpoints ----
-      ALPACA_TRADING: https://paper-api.alpaca.markets              # paper trading
-      ALPACA_DATA_STOCKS: https://data.alpaca.markets/v2/stocks
-      ALPACA_DATA_OPTIONS: https://data.alpaca.markets/v1beta1/options
+      # --- timing / structure ---
+      OR_MINUTES: "10"            # opening range window (mins)
+      ENTRY_START_PT: "06:35"     # earliest PT time to consider entries
+      ENTRY_END_PT:   "08:30"     # last PT time to take fresh entries
 
-      # ---- Entry timing ----
-      # We run at ~6:23 AM PT. We'll warm the API, then wait for a cleaner entry.
-      COOLDOWN_SEC: "540"        # ~9 min cool-off after 6:23 -> ~6:32 PT
-      PULLBACK_SEC: "180"        # up to 3 min to find a small pullback toward VWAP/open
+      # --- Alpaca endpoints ---
+      ALPACA_TRADING: https://paper-api.alpaca.markets
+      ALPACA_DATA:    https://data.alpaca.markets
 
-      # ---- Contract selection ----
-      TARGET_DELTA: "0.30"       # use closest-to 0.30 |Δ| if greeks available; else ATM
-      USE_SAME_DAY: "true"       # prefer same-day expiry; fall back to next available
+      # --- contract filters (options) ---
+      TARGET_DELTA_MIN: "0.25"
+      TARGET_DELTA_MAX: "0.35"
+      MIN_OI: "1000"
+      MIN_VOL: "200"
+      MAX_SPREAD_PCT: "0.05"      # 5% of mid
 
-      # ---- Risk / exits (on the option premium) ----
-      TAKE_PROFIT_PCT: "0.60"    # +60% on paid premium
-      MAX_LOSS_PCT:     "0.40"   # -40% on paid premium
-      MAX_HOLD_MIN:     "390"    # minutes; flatten before close (~6.5h = 390 min)
+      # --- risk & exits ---
+      RISK_PCT: "0.006"           # 0.6% of equity max risk per trade
+      TAKE_PARTIAL_PCT: "0.30"    # +30% take 50% off
+      TIME_STOP_MIN: "45"         # exit if not +15% in 45 min
+      FAST_TP_PCT: "0.15"         # +15% within TIME_STOP_MIN
 
     steps:
-      - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y jq coreutils
+      - name: Install jq (JSON)
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Warm your Render app to minimize cold-start lag
+      # Warm the API to avoid Render cold start
       - name: Warm Render app
         id: warm
-        shell: bash
         run: |
           set -euo pipefail
-          echo "Warming $HEALTH_URL ..."
           for i in {1..6}; do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
-            echo "Attempt $i -> HTTP $CODE"
-            if [ "$CODE" = "200" ]; then
-              echo "warm_ok=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+            echo "Warm attempt $i -> HTTP $CODE"
+            [ "$CODE" = "200" ] && exit 0
             sleep 10
           done
-          echo "warm_ok=false" >> "$GITHUB_OUTPUT"
+          echo "Warning: healthz not warm; continuing."
 
-      # Call your model
-      - name: Call SPY API (with retries)
+      - name: Call SPY API
         id: call
-        shell: bash
         run: |
           set -euo pipefail
-          RES=""
-          for i in {1..5}; do
-            RES=$(curl -sS -m 30 -X POST "$API_URL" -H "Content-Type: application/json" -d '{}') || true
-            if echo "$RES" | jq -e 'has("model_call") and has("confidence")' >/dev/null 2>&1; then
-              break
-            fi
-            echo "Attempt $i not JSON / missing fields. Sleeping 6s…"
-            sleep 6
-          done
-          echo "res=$(echo "$RES" | jq -c . 2>/dev/null || echo '{}')" >> "$GITHUB_OUTPUT"
+          RES=$(curl -sS -m 25 -X POST "$API_URL" -H "Content-Type: application/json" -d '{}' )
+          echo "$RES" | jq .
+          JSON_MIN=$(echo "$RES" | jq -c .)
+          echo "res=$JSON_MIN" >> "$GITHUB_OUTPUT"
 
-      # Decide whether to trade
-      - name: Prep decision
-        id: prep
-        shell: bash
+      - name: Decide (confidence + regime + non-sideways)
+        id: decide
         run: |
-          set -euo pipefail
           JSON='${{ steps.call.outputs.res }}'
-          echo "Model JSON:"
-          echo "$JSON" | jq .
-
           MODEL=$(echo "$JSON" | jq -r '.model_call // "UNKNOWN"')
           CONF=$(echo "$JSON" | jq -r '.confidence // 0')
+          REG_PASS=$(echo "$JSON" | jq -r '.regime_pass // false')
+
           MIN_CONF="${MIN_CONF}"
+          ALLOW_SIDEWAYS="${ALLOW_SIDEWAYS}"
+          REQUIRE_REGIME="${REQUIRE_REGIME_PASS}"
 
-          SHOULD_TRADE="false"
-          SIDE="buy"          # for calls (Up) by default
-          OPT_RIGHT="call"
-          if [ "$MODEL" = "Down" ]; then SIDE="buy"; OPT_RIGHT="put"; fi
-
-          if [ "$MODEL" = "Sideways" ] && [ "${ALLOW_SIDEWAYS}" = "false" ]; then
-            SHOULD_TRADE="false"
-          else
-            # confidence rule
-            awk "BEGIN{exit !($CONF >= $MIN_CONF)}" && SHOULD_TRADE="true" || SHOULD_TRADE="false"
-          fi
+          OK="true"
+          awk "BEGIN{exit !($CONF >= $MIN_CONF)}" || OK="false"
+          if [ "$ALLOW_SIDEWAYS" = "false" ] && [ "$MODEL" = "Sideways" ]; then OK="false"; fi
+          if [ "$REQUIRE_REGIME" = "true" ] && [ "$REG_PASS" != "true" ]; then OK="false"; fi
 
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
           echo "conf=$CONF" >> "$GITHUB_OUTPUT"
-          echo "opt_right=$OPT_RIGHT" >> "$GITHUB_OUTPUT"
-          echo "should_trade=$SHOULD_TRADE" >> "$GITHUB_OUTPUT"
+          echo "regime_pass=$REG_PASS" >> "$GITHUB_OUTPUT"
+          echo "should_trade=$OK" >> "$GITHUB_OUTPUT"
 
-          echo "subject=SPY Pre-Open: $MODEL (conf $CONF)" >> "$GITHUB_OUTPUT"
-          printf "body<<EOF\nDirection: %s\nConfidence: %s\nTime: %s\nEOF\n" \
-            "$MODEL" "$CONF" "${{ github.run_started_at }}" >> "$GITHUB_OUTPUT"
-
-      # Cool-off after open to avoid the first-minute noise, then attempt a small pullback entry
-      - name: Entry timing window (cool-off + pullback scan)
-        id: entry_timing
-        if: ${{ steps.prep.outputs.should_trade == 'true' }}
-        shell: bash
-        env:
-          APCA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
-          APCA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: |
-          set -euo pipefail
-          echo "Cooling for ${COOLDOWN_SEC}s…"
-          sleep "${COOLDOWN_SEC}"
-
-          echo "Scanning for small pullback for up to ${PULLBACK_SEC}s…"
-          END=$(( $(date +%s) + ${PULLBACK_SEC} ))
-          HIT="false"
-          DIR='${{ steps.prep.outputs.model }}'  # Up or Down
-          while [ $(date +%s) -lt $END ]; do
-            # Use last two 1-min bars as a crude pullback signal
-            BARS=$(curl -sS -H "APCA-API-KEY-ID: $APCA_KEY_ID" \
-                          -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" \
-                          "$ALPACA_DATA_STOCKS/SPY/bars?timeframe=1Min&limit=3")
-            LAST=$(echo "$BARS" | jq -r '.bars[-1].c // 0')
-            PREV=$(echo "$BARS" | jq -r '.bars[-2].c // 0')
-            OPEN=$(echo "$BARS" | jq -r '.bars[0].o // 0')
-
-            if [ "$DIR" = "Up" ]; then
-              # prefer a tiny dip toward open/prev before entering long (calls)
-              awk "BEGIN{exit !($LAST <= $PREV)}" && HIT="true" && break || true
-            else
-              # prefer a tiny bounce toward open/prev before entering short (puts)
-              awk "BEGIN{exit !($LAST >= $PREV)}" && HIT="true" && break || true
-            fi
-            sleep 5
-          done
-          echo "pullback_ok=$HIT" >> "$GITHUB_OUTPUT"
-
-      # Choose option contract (ATM if no greeks; else closest to |delta| target)
-      - name: Pick contract
-        id: pick
-        if: ${{ steps.prep.outputs.should_trade == 'true' }}
-        shell: bash
-        env:
-          APCA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
-          APCA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: |
-          set -euo pipefail
-          RIGHT='${{ steps.prep.outputs.opt_right }}'   # call or put
-
-          # 1) Get latest SPY trade to find ATM strike
-          SPY_LAST=$(curl -sS -H "APCA-API-KEY-ID: $APCA_KEY_ID" \
-                           -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" \
-                           "$ALPACA_DATA_STOCKS/SPY/trades/latest" | jq -r '.trade.p // 0')
-          if [ "$SPY_LAST" = "0" ] || [ -z "$SPY_LAST" ]; then
-            echo "Could not get SPY last, abort."
-            exit 1
-          fi
-
-          # 2) Find candidate expirations: prefer same day, else next
-          TODAY=$(date -u +%Y-%m-%d)
-          # contracts endpoint (v1beta1) – may vary; we filter active, nearest expiration
-          # try same-day first
-          QSME="$ALPACA_DATA_OPTIONS/contracts?underlying=SPY&status=active&expirationDate=$TODAY&limit=2000"
-          CSME=$(curl -sS -H "APCA-API-KEY-ID: $APCA_KEY_ID" -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" "$QSME" || echo '{}')
-          CNT_SME=$(echo "$CSME" | jq '.contracts | length // 0')
-
-          if [ "$USE_SAME_DAY" = "true" ] && [ "$CNT_SME" -gt 0 ]; then
-            CONTRACTS="$CSME"
-          else
-            # next available expiry (simplified: ask for next 7 days and pick the earliest)
-            QNXT="$ALPACA_DATA_OPTIONS/contracts?underlying=SPY&status=active&limit=2000"
-            CNXT=$(curl -sS -H "APCA-API-KEY-ID: $APCA_KEY_ID" -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" "$QNXT" || echo '{}')
-            CONTRACTS="$CNXT"
-          fi
-
-          # 3) Choose the strike nearest ATM & desired RIGHT
-          #    We’ll downselect to ~50 around spot to reduce snapshot calls.
-          SPOT_ROUND=$(printf "%.0f\n" "$SPY_LAST")
-          LOWER=$((SPOT_ROUND - 25))
-          UPPER=$((SPOT_ROUND + 25))
-
-          SYMS=$(echo "$CONTRACTS" | jq -r --arg r "$RIGHT" --argjson lo $LOWER --argjson up $UPPER '
-            (.contracts // [])
-            | map(select(.type == ($r | ascii_upcase)))
-            | map(select(.strike >= $lo and .strike <= $up))
-            | sort_by(.expiration_date, (.strike))
-            | [.[0:400][]]        # cap list
-            | map(.symbol)
-            | join(",")
-          ')
-
-          if [ -z "$SYMS" ]; then
-            echo "No candidate symbols found." ; exit 1
-          fi
-
-          # 4) Pull snapshots for the candidates to get greeks / mid
-          SNAP=$(curl -sS -H "APCA-API-KEY-ID: $APCA_KEY_ID" -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" \
-                 --get "$ALPACA_DATA_OPTIONS/snapshots" --data-urlencode "symbols=$SYMS" || echo '{}')
-
-          # 5) Score: prefer target |delta| if present, else closest strike to spot (ATM)
-          TARGET=${TARGET_DELTA}
-          BEST=$(echo "$SNAP" | jq -r --argjson tgt "$TARGET" --argjson spot "$SPY_LAST" '
-            .snapshots
-            | to_entries
-            | map({
-                sym: .key,
-                mid: ((.value.latest_quote.bp + .value.latest_quote.ap)/2),
-                strike: (.value.contract.strike // 0),
-                delta: ( (.value.greeks.delta // empty) | tonumber? ),
-                score: (
-                  if (.value.greeks.delta // empty) then
-                    (( ( ( (.value.greeks.delta // 0) | tonumber? ) | if . == null then 0 else . end ) | fabs ) - $tgt) # |Δ|-target
-                  else
-                    ( ((.value.contract.strike // 0) - $spot) | fabs ) # ATM fallback
-                  end
-                )
-              })
-            | map(select(.mid > 0))
-            | sort_by(.score)
-            | .[0]
-            | if . == null then empty else @json end
-          ')
-          if [ -z "$BEST" ]; then
-            echo "Could not pick a best contract." ; exit 1
-          fi
-
-          echo "$BEST" | jq .
-          BEST_SYM=$(echo "$BEST" | jq -r '.sym')
-          BEST_MID=$(echo "$BEST" | jq -r '.mid')
-          echo "symbol=$BEST_SYM" >> "$GITHUB_OUTPUT"
-          echo "entry_ref_mid=$BEST_MID" >> "$GITHUB_OUTPUT"
-
-      # Place option order (market buy 1x)
-      - name: Place option order
-        id: order
-        if: ${{ steps.prep.outputs.should_trade == 'true' }}
-        shell: bash
-        env:
-          APCA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
-          APCA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: |
-          set -euo pipefail
-          SYM='${{ steps.pick.outputs.symbol }}'
-          if [ -z "$SYM" ]; then echo "No contract symbol chosen."; exit 1; fi
-
-          echo "Buying 1 $SYM (market, paper)…"
-          ORD=$(curl -sS -X POST "$ALPACA_TRADING/v2/options/orders" \
-                 -H "APCA-API-KEY-ID: $APCA_KEY_ID" \
-                 -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" \
-                 -H "Content-Type: application/json" \
-                 -d "$(jq -n --arg sym "$SYM" '{symbol:$sym, qty:"1", side:"buy", type:"market", time_in_force:"day"}')" \
-                 || true)
-          echo "$ORD" | jq .
-          OID=$(echo "$ORD" | jq -r '.id // empty')
-          if [ -z "$OID" ]; then echo "Order failed"; exit 1; fi
-          echo "order_id=$OID" >> "$GITHUB_OUTPUT"
-
-      # Manage exits: take-profit, max-loss, or time stop
-      - name: Manage position and exit
-        id: manage
-        if: ${{ steps.prep.outputs.should_trade == 'true' && steps.order.outputs.order_id != '' }}
-        shell: bash
-        env:
-          APCA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
-          APCA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: |
-          set -euo pipefail
-          SYM='${{ steps.pick.outputs.symbol }}'
-          ENTRY_REF='${{ steps.pick.outputs.entry_ref_mid }}'
-
-          # Wait for fill & capture entry price
-          echo "Waiting for fill…"
-          FILL_PRICE=""
-          for i in {1..60}; do
-            POS=$(curl -sS -H "APCA-API-KEY-ID: $APCA_KEY_ID" \
-                        -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" \
-                        "$ALPACA_TRADING/v2/options/positions/$SYM" || echo "")
-            QTY=$(echo "$POS" | jq -r '.qty // "0"')
-            if [ "$QTY" != "0" ] && [ "$QTY" != "" ]; then
-              FILL_PRICE=$(echo "$POS" | jq -r '.avg_entry_price // empty')
-              if [ -n "$FILL_PRICE" ]; then break; fi
-            fi
-            sleep 2
-          done
-
-          if [ -z "$FILL_PRICE" ]; then
-            echo "No fill detected; abort managing."
-            exit 0
-          fi
-          echo "Filled avg price: $FILL_PRICE"
-
-          TP=$(awk -v p="$FILL_PRICE" -v r="${TAKE_PROFIT_PCT}" 'BEGIN{printf "%.4f", p*(1+r)}')
-          SL=$(awk -v p="$FILL_PRICE" -v r="${MAX_LOSS_PCT}"   'BEGIN{printf "%.4f", p*(1-r)}')
-          echo "Targets: TP=$TP  SL=$SL"
-
-          START=$(date +%s)
-          LIMIT_MIN=${MAX_HOLD_MIN}
-          while true; do
-            NOW=$(date +%s)
-            ELAPSED=$(( (NOW - START) / 60 ))
-            # get latest quote (mid)
-            SNAP=$(curl -sS -H "APCA-API-KEY-ID: $APCA_KEY_ID" \
-                        -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" \
-                        "$ALPACA_DATA_OPTIONS/snapshots?symbols=$SYM")
-            MID=$(echo "$SNAP" | jq -r '(.snapshots["'"$SYM"'"].latest_quote.bp + .snapshots["'"$SYM"'"].latest_quote.ap)/2' | awk '{printf "%.4f",$0}')
-            if [ -z "$MID" ] || [ "$MID" = "0.0000" ]; then sleep 10; continue; fi
-
-            # check exits
-            PROFIT_OK=$(awk -v m="$MID" -v tp="$TP" 'BEGIN{exit !(m>=tp)}' && echo 1 || echo 0)
-            LOSS_HIT=$(awk -v m="$MID" -v sl="$SL" 'BEGIN{exit !(m<=sl)}' && echo 1 || echo 0)
-
-            if [ "$PROFIT_OK" = "1" ] || [ "$LOSS_HIT" = "1" ] || [ "$ELAPSED" -ge "$LIMIT_MIN" ]; then
-              echo "Exit condition met (profit=$PROFIT_OK loss=$LOSS_HIT elapsed=${ELAPSED}m). Closing…"
-              curl -sS -X DELETE "$ALPACA_TRADING/v2/options/positions/$SYM" \
-                   -H "APCA-API-KEY-ID: $APCA_KEY_ID" \
-                   -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" | jq .
-              break
-            fi
-            sleep 20
-          done
-
-      # Always email the outcome
-      - name: Email me the prediction / outcome
+      - name: Email me the prediction
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -344,12 +100,237 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_USERNAME }}
           from: "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
-          subject: ${{ steps.prep.outputs.subject }}
+          subject: ${{ format('SPY Pre-Open: {0} (conf {1})', steps.decide.outputs.model, steps.decide.outputs.conf) }}
           body: |
-            $(echo "${{ steps.prep.outputs.body }}")
-            Warmed:       ${{ steps.warm.outputs.warm_ok }}
-            ShouldTrade:  ${{ steps.prep.outputs.should_trade }}
-            Right:        ${{ steps.prep.outputs.opt_right }}
-            Contract:     ${{ steps.pick.outputs.symbol }}
-            EntryRefMid:  ${{ steps.pick.outputs.entry_ref_mid }}
-            Note: Exits use +${{ env.TAKE_PROFIT_PCT }} / -${{ env.MAX_LOSS_PCT }} or time stop ({{ env.MAX_HOLD_MIN }} min).
+            Decision window:
+              model: ${{ steps.decide.outputs.model }}
+              conf:  ${{ steps.decide.outputs.conf }}
+              regime_pass: ${{ steps.decide.outputs.regime_pass }}
+              should_trade: ${{ steps.decide.outputs.should_trade }}
+            Raw JSON:
+            ${{ steps.call.outputs.res }}
+
+      # ------------------ ENTRY STRUCTURE GATE ------------------
+      # VWAP + Opening-Range (first OR_MINUTES) confirmation before options
+      - name: Structure gate (OR + VWAP)
+        id: gate
+        if: ${{ steps.decide.outputs.should_trade == 'true' }}
+        env:
+          KEY: ${{ secrets.ALPACA_KEY_ID }}
+          SEC: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+
+          # time window guard (PT)
+          now_pt=$(TZ=America/Los_Angeles date +%H:%M)
+          start="${ENTRY_START_PT}"
+          end="${ENTRY_END_PT}"
+
+          if [[ "$now_pt" < "$start" || "$now_pt" > "$end" ]]; then
+            echo "window_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # pull last 60 minutes of 1-min bars to compute OR + VWAP
+          START=$(date -u -d '90 minutes ago' +"%Y-%m-%dT%H:%M:%SZ")
+          BARS=$(curl -sS "${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Min&start=${START}" \
+                    -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
+          COUNT=$(echo "$BARS" | jq '.bars | length')
+          if [ "$COUNT" -lt 10 ]; then
+            echo "window_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # compute OR high/low from first OR_MINUTES bars after session open (assumes bars sorted)
+          # also compute simple VWAP from the returned window
+          OR_N=${OR_MINUTES}
+          OR_H=$(echo "$BARS" | jq "[.bars[:$OR_N][] | .h] | max")
+          OR_L=$(echo "$BARS" | jq "[.bars[:$OR_N][] | .l] | min")
+
+          VW_NUM=$(echo "$BARS" | jq '[.bars[] | ((.c+.h+.l)/3.0) * .v] | add')
+          VW_DEN=$(echo "$BARS" | jq '[.bars[] | .v] | add')
+          VWAP=$(python3 - <<'PY'
+import os,sys,json
+d=json.loads(sys.stdin.read())
+num=float(d["num"]); den=float(d["den"])
+print(num/den if den>0 else "0")
+PY
+          <<< "{\"num\": $VW_NUM, \"den\": $VW_DEN }")
+
+          LAST=$(echo "$BARS" | jq '.bars[-1].c')
+
+          MODEL='${{ steps.decide.outputs.model }}'
+          pass="false"
+          if [ "$MODEL" = "Up" ]; then
+            # need ORH break and price ≥ VWAP
+            cmp=$(python3 - <<PY
+orh=$OR_H; last=$LAST; vwap=float("$VWAP")
+print( int(last>=orh and last>=vwap) )
+PY
+)
+            [ "$cmp" = "1" ] && pass="true"
+          elif [ "$MODEL" = "Down" ]; then
+            cmp=$(python3 - <<PY
+orl=$OR_L; last=$LAST; vwap=float("$VWAP")
+print( int(last<=orl and last<=vwap) )
+PY
+)
+            [ "$cmp" = "1" ] && pass="true"
+          fi
+
+          echo "window_ok=true" >> "$GITHUB_OUTPUT"
+          echo "structure_ok=$pass" >> "$GITHUB_OUTPUT"
+          echo "vwap=$VWAP" >> "$GITHUB_OUTPUT"
+          echo "orh=$OR_H" >> "$GITHUB_OUTPUT"
+          echo "orl=$OR_L" >> "$GITHUB_OUTPUT"
+
+      # ------------------ OPTIONS (SELECTION + MID-PEG IOC) ------------------
+      # This is a safe scaffold: if the chain/greeks endpoint fails on your plan,
+      # we skip trading and leave a clear log.
+      - name: Select option & place IOC ladder
+        if: ${{ steps.gate.outputs.window_ok == 'true' && steps.gate.outputs.structure_ok == 'true' }}
+        env:
+          KEY: ${{ secrets.ALPACA_KEY_ID }}
+          SEC: ${{ secrets.ALPACA_SECRET_KEY }}
+          DATA: ${{ env.ALPACA_DATA }}
+          TRADING: ${{ env.ALPACA_TRADING }}
+          TARGET_DELTA_MIN: ${{ env.TARGET_DELTA_MIN }}
+          TARGET_DELTA_MAX: ${{ env.TARGET_DELTA_MAX }}
+          MIN_OI: ${{ env.MIN_OI }}
+          MIN_VOL: ${{ env.MIN_VOL }}
+          MAX_SPREAD_PCT: ${{ env.MAX_SPREAD_PCT }}
+          RISK_PCT: ${{ env.RISK_PCT }}
+          FAST_TP_PCT: ${{ env.FAST_TP_PCT }}
+        run: |
+          set -euo pipefail
+
+          # get latest underlying quote
+          UQ=$(curl -sS "$DATA/v2/stocks/SPY/quotes/latest" -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
+          PX=$(echo "$UQ" | jq -r '.quote.ap')
+          [ "$PX" = "null" ] && PX=$(echo "$UQ" | jq -r '.quote.bp')
+          [ "$PX" = "null" ] && { echo "No SPY quote"; exit 0; }
+
+          # figure expiry: same-day if before 09:45 PT and weekday; else next Friday
+          now_pt=$(TZ=America/Los_Angeles date +%s)
+          cutoff=$(TZ=America/Los_Angeles date -d "$(date +%F) 09:45" +%s)
+          dow=$(TZ=America/Los_Angeles date +%u)   # 1=Mon ... 5=Fri
+          if [ "$now_pt" -lt "$cutoff" ] && [ "$dow" -le 5 ]; then
+            EXP=$(TZ=America/Los_Angeles date +%F)
+          else
+            # next Friday
+            EXP=$(TZ=America/Los_Angeles date -d "next Friday" +%F)
+          fi
+
+          # pull a small chain window around ATM using experimental contracts endpoint
+          # NOTE: if your plan doesn’t allow this endpoint, we’ll skip gracefully.
+          # Find ATM strike nearest to PX, round to whole dollar
+          ATM=$(python3 - <<PY
+import math,sys
+px=float(sys.argv[1])
+print(round(px))
+PY
+ "$PX")
+
+          # Build a small strike list around ATM (±6 strikes)
+          strikes=$(python3 - <<PY
+atm=int("$ATM"); print(",".join(str(atm+i) for i in range(-6,7)))
+PY
+)
+
+          # We will try to score a small set of candidate OCC symbols via snapshots
+          side='${{ steps.decide.outputs.model }}'
+          if [ "$side" = "Up" ]; then RIGHT="call"; else RIGHT="put"; fi
+
+          # Get candidate symbols via "unofficial" compose format: SPYYYMMDDC/Pxxxxx
+          # Then fetch snapshots to filter by OI/volume/spread/delta
+          SYMS=$(python3 - <<PY
+import sys,datetime
+exp=sys.argv[1]  # YYYY-MM-DD
+right=sys.argv[2] # call/put
+strikes=sys.argv[3].split(",")
+y,m,d=map(int,exp.split("-"))
+yy=str(y%100).zfill(2); mm=str(m).zfill(2); dd=str(d).zfill(2)
+out=[]
+for s in strikes:
+    k=int(s)
+    occ=f"SPY{yy}{mm}{dd}{'C' if right=='call' else 'P'}{int(k*1000):08d}"
+    out.append(occ)
+print(",".join(out))
+PY
+ "$EXP" "$RIGHT" "$strikes")
+
+          # snapshots (if not available, bail)
+          SNAP=$(curl -sS "$DATA/v1beta1/options/snapshots?symbols=$(printf %s "$SYMS" | sed 's/,/%2C/g')" \
+                    -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" || true)
+          ok=$(echo "$SNAP" | jq -r 'has("snapshots")')
+          [ "$ok" != "true" ] && { echo "Options snapshots not available on plan; skipping."; exit 0; }
+
+          # pick best by: delta in range, OI/Vol min, min spread pct
+          best=$(echo "$SNAP" | jq -r --argjson dmin $TARGET_DELTA_MIN --argjson dmax $TARGET_DELTA_MAX \
+                                --argjson moi $MIN_OI --argjson mvol $MIN_VOL --argjson msp $MAX_SPREAD_PCT '
+              .snapshots
+              | to_entries
+              | map(
+                  .key as $sym
+                  | .value as $s
+                  | ($s.greeks.delta // null) as $delta
+                  | ($s.latestQuote | {bp,ap}) as $q
+                  | ($s.latestTrade.p // null) as $ltp
+                  | ($s.dailyBar.v // 0) as $vol
+                  | ($s.greek?.theta // 0) as $th
+                  | ($s.details.openInterest // 0) as $oi
+                  | if ($delta==null or $q.bp==null or $q.ap==null) then empty else
+                      (.spread := ( ($q.ap - $q.bp) / ( ($q.ap + $q.bp)/2.0 ) ) )
+                      | select($delta>=$dmin and $delta<=$dmax and $oi>=$moi and $vol>=$mvol and .spread <= $msp)
+                      | {sym:$sym, delta:$delta, bp:$q.bp, ap:$q.ap, mid: (($q.ap + $q.bp)/2.0), spread:.spread, oi:$oi, vol:$vol}
+                    end
+                )
+              | sort_by(.spread) | first
+          ')
+
+          [ -z "$best" ] && { echo "No contract passed filters; skipping."; exit 0; }
+
+          SYM=$(echo "$best" | jq -r '.sym')
+          MID=$(echo "$best" | jq -r '.mid')
+
+          # account equity for sizing
+          ACCT=$(curl -sS "$TRADING/v2/account" -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
+          EQ=$(echo "$ACCT" | jq -r '.equity | tonumber')
+
+          # size: risk-based (assume max loss ~ premium)
+          # qty = floor( (equity * RISK_PCT) / (mid * 100) ), 100x multiplier
+          QTY=$(python3 - <<PY
+import math,sys
+eq=float(sys.argv[1]); rp=float(sys.argv[2]); mid=float(sys.argv[3])
+qty=math.floor( (eq*rp) / (max(mid,0.01)*100.0) )
+print(max(qty,1))
+PY
+ "$EQ" "$RISK_PCT" "$MID")
+
+          # ladder IOC: mid, then mid + 0.01, mid + 0.02 (calls buy; puts buy too—direction is via option right)
+          # Alpaca options order: POST /v2/options/orders
+          for step in 0 0.01 0.02; do
+            LMT=$(python3 - <<PY
+import sys
+mid=float(sys.argv[1]); inc=float(sys.argv[2])
+print(round(mid+inc,2))
+PY
+ "$MID" "$step")
+            echo "Trying IOC at $LMT for $SYM x $QTY"
+            ORD=$(curl -sS -X POST "$TRADING/v2/options/orders" \
+                    -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" -H "Content-Type: application/json" \
+                    -d "$(jq -n --arg sym "$SYM" --arg lmt "$LMT" --arg qty "$QTY" \
+                          '{symbol:$sym, qty:$qty, side:"buy", type:"limit", time_in_force:"ioc", limit_price:$lmt}')" || true)
+            st=$(echo "$ORD" | jq -r '.status // empty')
+            id=$(echo "$ORD" | jq -r '.id // empty')
+            echo "Order status: $st id: $id"
+            if [ "$st" = "accepted" ] || [ "$st" = "filled" ] || [ "$st" = "new" ] || [ "$st" = "partially_filled" ]; then
+              echo "opened_id=$id" >> "$GITHUB_OUTPUT"
+              echo "opened_sym=$SYM" >> "$GITHUB_OUTPUT"
+              echo "opened_mid=$MID" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            sleep 2
+          done
+
+      # (Optional) You can add a trailing/partials management job here once fills are confirmed
