@@ -1,0 +1,126 @@
+name: SPY Exit Manager
+
+on:
+  schedule:
+    # Every 5 min, 6:40–13:00 PT (roughly full session)
+    - cron: '*/5 13-20 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  manage_positions:
+    runs-on: ubuntu-latest
+    env:
+      ALPACA_TRADING: https://paper-api.alpaca.markets
+      ALPACA_DATA:    https://data.alpaca.markets
+      CLIENT_TAG: "SPYBOT"
+      TAKE_PARTIAL_PCT: "0.30"  # +30%
+      FAST_TP_PCT: "0.15"       # +15%
+      TIME_STOP_MIN: "45"       # 45 minutes
+    steps:
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Manage
+        env:
+          KEY: ${{ secrets.ALPACA_KEY_ID }}
+          SEC: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          TRD="${{ env.ALPACA_TRADING }}"; DATA="${{ env.ALPACA_DATA }}"
+          POS=$(curl -sS "$TRD/v2/options/positions" -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" || true)
+          ok=$(echo "$POS" | jq 'type=="array"')
+          [ "$ok" != "true" ] && { echo "no options positions endpoint or none open"; exit 0; }
+
+          N=$(echo "$POS" | jq 'length')
+          [ "$N" -eq 0 ] && { echo "no open option positions"; exit 0; }
+
+          echo "positions: $N"
+          for i in $(seq 0 $((N-1))); do
+            P=$(echo "$POS" | jq ".[$i]")
+            SYM=$(echo "$P" | jq -r '.symbol')
+            QTY=$(echo "$P" | jq -r '.qty | tonumber')
+            SIDE=$(echo "$P" | jq -r '.side')   # long/short
+            ENTRY=$(echo "$P" | jq -r '.avg_entry_price | tonumber')
+
+            # latest quote -> mid
+            SNAP=$(curl -sS "$DATA/v1beta1/options/snapshots?symbols=$SYM" -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" || true)
+            bp=$(echo "$SNAP" | jq -r ".snapshots.\"$SYM\".latestQuote.bp // empty")
+            ap=$(echo "$SNAP" | jq -r ".snapshots.\"$SYM\".latestQuote.ap // empty")
+            [ -z "$bp" -o -z "$ap" -o "$bp" = "null" -o "$ap" = "null" ] && { echo "no quote for $SYM"; continue; }
+            MID=$(python3 - <<PY
+import sys; print( (float(sys.argv[1])+float(sys.argv[2]))/2.0 )
+PY
+ "$bp" "$ap")
+
+            # P&L %
+            RET=$(python3 - <<PY
+import sys
+mid=float(sys.argv[1]); entry=float(sys.argv[2])
+print((mid-entry)/entry)
+PY
+ "$MID" "$ENTRY")
+
+            echo "$SYM qty=$QTY entry=$ENTRY mid=$MID ret=$RET"
+
+            # find any of our tagged entry orders today (to gauge fill time / partials)
+            ORD=$(curl -sS "$TRD/v2/options/orders?status=all&symbols=$SYM&nested=true" \
+                     -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
+            has_tag=$(echo "$ORD" | jq -r --arg tag "${{ env.CLIENT_TAG }}" \
+                       '[.[] | select(.client_order_id | contains($tag))] | length')
+            # fill time (first fill)
+            FILL_TS=$(echo "$ORD" | jq -r --arg tag "${{ env.CLIENT_TAG }}" \
+                       '[.[] | select(.client_order_id | contains($tag)) | .filled_at] | map(select(.!=null)) | sort | .[0]')
+            # any sell already today?
+            SOLD_TODAY=$(echo "$ORD" | jq -r --arg tag "${{ env.CLIENT_TAG }}" \
+                       '[.[] | select(.client_order_id | contains($tag) and .side=="sell" and .status=="filled")] | length')
+
+            # time since fill (minutes)
+            AGE_MIN=9999
+            if [ "$FILL_TS" != "null" ] && [ -n "$FILL_TS" ]; then
+              AGE_MIN=$(python3 - <<PY
+import sys,datetime
+from dateutil import parser
+t=parser.isoparse(sys.argv[1])
+now=datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+print(int((now-t).total_seconds()/60))
+PY
+ "$FILL_TS")
+            fi
+
+            # 1) Partial at +30% (once)
+            if python3 - <<PY
+import sys
+ret=float(sys.argv[1]); tp=float(sys.argv[2]); sold=int(sys.argv[3]); qty=int(sys.argv[4])
+print( int(ret>=tp and sold==0 and qty>=2) )
+PY
+ "$RET" "${{ env.TAKE_PARTIAL_PCT }}" "$SOLD_TODAY" "$QTY"
+            then
+              SELL_QTY=$(( QTY//2 ))
+              echo "Partial: sell $SELL_QTY of $SYM (ret=$RET)"
+              curl -sS -X POST "$TRD/v2/options/orders" \
+                -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" -H "Content-Type: application/json" \
+                -d "$(jq -n --arg sym "$SYM" --arg qty "$SELL_QTY" \
+                      --arg cid "${{ env.CLIENT_TAG }}-PARTIAL-$(date +%H%M%S)" \
+                      '{symbol:$sym, qty:$qty, side:"sell", type:"market", time_in_force:"ioc", client_order_id:$cid}')" \
+                | jq -r '.status'
+              continue
+            fi
+
+            # 2) Time stop: if not +15% by TIME_STOP_MIN, exit full
+            if python3 - <<PY
+import sys
+age=int(sys.argv[1]); ret=float(sys.argv[2]); fast=float(sys.argv[3])
+print( int(age>=${{ env.TIME_STOP_MIN }} and ret<fast) )
+PY
+ "$AGE_MIN" "$RET" "${{ env.FAST_TP_PCT }}"
+            then
+              echo "Time stop: exit $SYM (age ${AGE_MIN}m, ret $RET)"
+              curl -sS -X POST "$TRD/v2/options/orders" \
+                -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" -H "Content-Type: application/json" \
+                -d "$(jq -n --arg sym "$SYM" --arg qty "$QTY" \
+                      --arg cid "${{ env.CLIENT_TAG }}-TIMESTOP-$(date +%H%M%S)" \
+                      '{symbol:$sym, qty:$qty, side:"sell", type:"market", time_in_force:"ioc", client_order_id:$cid}')" \
+                | jq -r '.status'
+              continue
+            fi
+          done
