@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  call_api:
+  enter_trade:
     runs-on: ubuntu-latest
     env:
       API_URL: https://spy-preopen-api.onrender.com/predict
@@ -33,63 +33,50 @@ jobs:
       TARGET_DELTA_MAX: "0.35"
       MIN_OI: "1000"
       MIN_VOL: "200"
-      MAX_SPREAD_PCT: "0.05"      # 5% of mid
+      MAX_SPREAD_PCT: "0.05"      # <=5% of mid
 
-      # --- risk & exits ---
-      RISK_PCT: "0.006"           # 0.6% of equity max risk per trade
+      # --- risk & exits (used also by manager) ---
+      RISK_PCT: "0.006"           # risk 0.6% of equity per entry
       TAKE_PARTIAL_PCT: "0.30"    # +30% take 50% off
-      TIME_STOP_MIN: "45"         # exit if not +15% in 45 min
       FAST_TP_PCT: "0.15"         # +15% within TIME_STOP_MIN
+      TIME_STOP_MIN: "45"         # if not +15% by 45m, exit
+      CLIENT_TAG: "SPYBOT"        # used to tag client_order_id for tracking
 
     steps:
-      - name: Install jq (JSON)
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Warm the API to avoid Render cold start
-      - name: Warm Render app
-        id: warm
+      - name: Warm API
         run: |
-          set -euo pipefail
           for i in {1..6}; do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
-            echo "Warm attempt $i -> HTTP $CODE"
-            [ "$CODE" = "200" ] && exit 0
-            sleep 10
+            c=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
+            echo "warm $i -> $c"; [ "$c" = "200" ] && break; sleep 10
           done
-          echo "Warning: healthz not warm; continuing."
 
       - name: Call SPY API
         id: call
         run: |
-          set -euo pipefail
           RES=$(curl -sS -m 25 -X POST "$API_URL" -H "Content-Type: application/json" -d '{}' )
           echo "$RES" | jq .
-          JSON_MIN=$(echo "$RES" | jq -c .)
-          echo "res=$JSON_MIN" >> "$GITHUB_OUTPUT"
+          echo "res=$(echo "$RES" | jq -c .)" >> "$GITHUB_OUTPUT"
 
       - name: Decide (confidence + regime + non-sideways)
         id: decide
         run: |
-          JSON='${{ steps.call.outputs.res }}'
-          MODEL=$(echo "$JSON" | jq -r '.model_call // "UNKNOWN"')
-          CONF=$(echo "$JSON" | jq -r '.confidence // 0')
-          REG_PASS=$(echo "$JSON" | jq -r '.regime_pass // false')
-
-          MIN_CONF="${MIN_CONF}"
-          ALLOW_SIDEWAYS="${ALLOW_SIDEWAYS}"
-          REQUIRE_REGIME="${REQUIRE_REGIME_PASS}"
-
-          OK="true"
-          awk "BEGIN{exit !($CONF >= $MIN_CONF)}" || OK="false"
-          if [ "$ALLOW_SIDEWAYS" = "false" ] && [ "$MODEL" = "Sideways" ]; then OK="false"; fi
-          if [ "$REQUIRE_REGIME" = "true" ] && [ "$REG_PASS" != "true" ]; then OK="false"; fi
-
+          J='${{ steps.call.outputs.res }}'
+          MODEL=$(echo "$J" | jq -r '.model_call // "UNKNOWN"')
+          CONF=$(echo "$J" | jq -r '.confidence // 0')
+          REG=$(echo "$J" | jq -r '.regime_pass // false')
+          OK=true
+          awk "BEGIN{exit !($CONF >= ${{ env.MIN_CONF }})}" || OK=false
+          if [ "${{ env.ALLOW_SIDEWAYS }}" = "false" ] && [ "$MODEL" = "Sideways" ]; then OK=false; fi
+          if [ "${{ env.REQUIRE_REGIME_PASS }}" = "true" ] && [ "$REG" != "true" ]; then OK=false; fi
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
           echo "conf=$CONF" >> "$GITHUB_OUTPUT"
-          echo "regime_pass=$REG_PASS" >> "$GITHUB_OUTPUT"
+          echo "reg_ok=$REG" >> "$GITHUB_OUTPUT"
           echo "should_trade=$OK" >> "$GITHUB_OUTPUT"
 
-      - name: Email me the prediction
+      - name: Email pre-open snapshot
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -102,17 +89,14 @@ jobs:
           from: "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
           subject: ${{ format('SPY Pre-Open: {0} (conf {1})', steps.decide.outputs.model, steps.decide.outputs.conf) }}
           body: |
-            Decision window:
-              model: ${{ steps.decide.outputs.model }}
-              conf:  ${{ steps.decide.outputs.conf }}
-              regime_pass: ${{ steps.decide.outputs.regime_pass }}
-              should_trade: ${{ steps.decide.outputs.should_trade }}
-            Raw JSON:
-            ${{ steps.call.outputs.res }}
+            model:        ${{ steps.decide.outputs.model }}
+            confidence:   ${{ steps.decide.outputs.conf }}
+            regime_pass:  ${{ steps.decide.outputs.reg_ok }}
+            should_trade: ${{ steps.decide.outputs.should_trade }}
+            raw: ${{ steps.call.outputs.res }}
 
-      # ------------------ ENTRY STRUCTURE GATE ------------------
-      # VWAP + Opening-Range (first OR_MINUTES) confirmation before options
-      - name: Structure gate (OR + VWAP)
+      # --------- structure gate (OR break + VWAP within time window) ----------
+      - name: Structure gate (OR+VWAP)
         id: gate
         if: ${{ steps.decide.outputs.should_trade == 'true' }}
         env:
@@ -120,217 +104,181 @@ jobs:
           SEC: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
           set -euo pipefail
-
-          # time window guard (PT)
           now_pt=$(TZ=America/Los_Angeles date +%H:%M)
-          start="${ENTRY_START_PT}"
-          end="${ENTRY_END_PT}"
+          [[ "$now_pt" < "${{ env.ENTRY_START_PT }}" || "$now_pt" > "${{ env.ENTRY_END_PT }}" ]] && \
+            echo "window_ok=false" >> "$GITHUB_OUTPUT" && exit 0
 
-          if [[ "$now_pt" < "$start" || "$now_pt" > "$end" ]]; then
-            echo "window_ok=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # pull last 60 minutes of 1-min bars to compute OR + VWAP
           START=$(date -u -d '90 minutes ago' +"%Y-%m-%dT%H:%M:%SZ")
-          BARS=$(curl -sS "${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Min&start=${START}" \
-                    -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
-          COUNT=$(echo "$BARS" | jq '.bars | length')
-          if [ "$COUNT" -lt 10 ]; then
-            echo "window_ok=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          BARS=$(curl -sS "${{ env.ALPACA_DATA }}/v2/stocks/SPY/bars?timeframe=1Min&start=${START}" \
+                   -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
+          CNT=$(echo "$BARS" | jq '.bars | length')
+          [ "$CNT" -lt 10 ] && echo "window_ok=false" >> "$GITHUB_OUTPUT" && exit 0
 
-          # compute OR high/low from first OR_MINUTES bars after session open (assumes bars sorted)
-          # also compute simple VWAP from the returned window
-          OR_N=${OR_MINUTES}
+          OR_N=${{ env.OR_MINUTES }}
           OR_H=$(echo "$BARS" | jq "[.bars[:$OR_N][] | .h] | max")
           OR_L=$(echo "$BARS" | jq "[.bars[:$OR_N][] | .l] | min")
 
           VW_NUM=$(echo "$BARS" | jq '[.bars[] | ((.c+.h+.l)/3.0) * .v] | add')
           VW_DEN=$(echo "$BARS" | jq '[.bars[] | .v] | add')
           VWAP=$(python3 - <<'PY'
-import os,sys,json
-d=json.loads(sys.stdin.read())
-num=float(d["num"]); den=float(d["den"])
-print(num/den if den>0 else "0")
+import json,sys
+d=json.loads(sys.stdin.read()); n=float(d["n"]); v=float(d["v"])
+print(n/v if v>0 else 0)
 PY
-          <<< "{\"num\": $VW_NUM, \"den\": $VW_DEN }")
+<<< "{\"n\": $VW_NUM, \"v\": $VW_DEN }")
 
           LAST=$(echo "$BARS" | jq '.bars[-1].c')
-
           MODEL='${{ steps.decide.outputs.model }}'
-          pass="false"
+          pass=false
           if [ "$MODEL" = "Up" ]; then
-            # need ORH break and price ≥ VWAP
-            cmp=$(python3 - <<PY
-orh=$OR_H; last=$LAST; vwap=float("$VWAP")
-print( int(last>=orh and last>=vwap) )
+            python3 - <<PY
+orh=float($OR_H); last=float($LAST); vwap=float("$VWAP")
+print("pass=true" if (last>=orh and last>=vwap) else "pass=false")
 PY
-)
-            [ "$cmp" = "1" ] && pass="true"
           elif [ "$MODEL" = "Down" ]; then
-            cmp=$(python3 - <<PY
-orl=$OR_L; last=$LAST; vwap=float("$VWAP")
-print( int(last<=orl and last<=vwap) )
+            python3 - <<PY
+orl=float($OR_L); last=float($LAST); vwap=float("$VWAP")
+print("pass=true" if (last<=orl and last<=vwap) else "pass=false")
 PY
-)
-            [ "$cmp" = "1" ] && pass="true"
-          fi
+          else
+            echo "pass=false"
+          fi >> "$GITHUB_OUTPUT"
 
           echo "window_ok=true" >> "$GITHUB_OUTPUT"
-          echo "structure_ok=$pass" >> "$GITHUB_OUTPUT"
           echo "vwap=$VWAP" >> "$GITHUB_OUTPUT"
           echo "orh=$OR_H" >> "$GITHUB_OUTPUT"
           echo "orl=$OR_L" >> "$GITHUB_OUTPUT"
 
-      # ------------------ OPTIONS (SELECTION + MID-PEG IOC) ------------------
-      # This is a safe scaffold: if the chain/greeks endpoint fails on your plan,
-      # we skip trading and leave a clear log.
+      # ------------------ select option + place entry (IOC ladder) ------------------
       - name: Select option & place IOC ladder
-        if: ${{ steps.gate.outputs.window_ok == 'true' && steps.gate.outputs.structure_ok == 'true' }}
+        id: entry
+        if: ${{ steps.gate.outputs.window_ok == 'true' && steps.gate.outputs.pass == 'true' }}
         env:
           KEY: ${{ secrets.ALPACA_KEY_ID }}
           SEC: ${{ secrets.ALPACA_SECRET_KEY }}
-          DATA: ${{ env.ALPACA_DATA }}
-          TRADING: ${{ env.ALPACA_TRADING }}
-          TARGET_DELTA_MIN: ${{ env.TARGET_DELTA_MIN }}
-          TARGET_DELTA_MAX: ${{ env.TARGET_DELTA_MAX }}
-          MIN_OI: ${{ env.MIN_OI }}
-          MIN_VOL: ${{ env.MIN_VOL }}
-          MAX_SPREAD_PCT: ${{ env.MAX_SPREAD_PCT }}
-          RISK_PCT: ${{ env.RISK_PCT }}
-          FAST_TP_PCT: ${{ env.FAST_TP_PCT }}
         run: |
           set -euo pipefail
+          DATA="${{ env.ALPACA_DATA }}"; TRD="${{ env.ALPACA_TRADING }}"
+          J='${{ steps.decide.outputs.model }}'
+          SIDE="call"; [ "$J" = "Down" ] && SIDE="put"
 
-          # get latest underlying quote
+          # underlying quote
           UQ=$(curl -sS "$DATA/v2/stocks/SPY/quotes/latest" -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
-          PX=$(echo "$UQ" | jq -r '.quote.ap')
-          [ "$PX" = "null" ] && PX=$(echo "$UQ" | jq -r '.quote.bp')
-          [ "$PX" = "null" ] && { echo "No SPY quote"; exit 0; }
+          PX=$(echo "$UQ" | jq -r '.quote.ap // .quote.bp')
+          [ "$PX" = "null" ] && { echo "no SPY quote"; exit 0; }
 
-          # figure expiry: same-day if before 09:45 PT and weekday; else next Friday
+          # expiry choice
           now_pt=$(TZ=America/Los_Angeles date +%s)
           cutoff=$(TZ=America/Los_Angeles date -d "$(date +%F) 09:45" +%s)
-          dow=$(TZ=America/Los_Angeles date +%u)   # 1=Mon ... 5=Fri
-          if [ "$now_pt" -lt "$cutoff" ] && [ "$dow" -le 5 ]; then
-            EXP=$(TZ=America/Los_Angeles date +%F)
-          else
-            # next Friday
-            EXP=$(TZ=America/Los_Angeles date -d "next Friday" +%F)
-          fi
+          dow=$(TZ=America/Los_Angeles date +%u)
+          if [ "$now_pt" -lt "$cutoff" ] && [ "$dow" -le 5 ]; then EXP=$(TZ=America/Los_Angeles date +%F); else EXP=$(TZ=America/Los_Angeles date -d "next Friday" +%F); fi
 
-          # pull a small chain window around ATM using experimental contracts endpoint
-          # NOTE: if your plan doesn’t allow this endpoint, we’ll skip gracefully.
-          # Find ATM strike nearest to PX, round to whole dollar
+          # candidate strikes around ATM
           ATM=$(python3 - <<PY
-import math,sys
-px=float(sys.argv[1])
-print(round(px))
+import math,sys; print(round(float(sys.argv[1])))
 PY
  "$PX")
-
-          # Build a small strike list around ATM (±6 strikes)
           strikes=$(python3 - <<PY
 atm=int("$ATM"); print(",".join(str(atm+i) for i in range(-6,7)))
 PY
 )
-
-          # We will try to score a small set of candidate OCC symbols via snapshots
-          side='${{ steps.decide.outputs.model }}'
-          if [ "$side" = "Up" ]; then RIGHT="call"; else RIGHT="put"; fi
-
-          # Get candidate symbols via "unofficial" compose format: SPYYYMMDDC/Pxxxxx
-          # Then fetch snapshots to filter by OI/volume/spread/delta
+          RIGHT="$SIDE"
           SYMS=$(python3 - <<PY
-import sys,datetime
-exp=sys.argv[1]  # YYYY-MM-DD
-right=sys.argv[2] # call/put
-strikes=sys.argv[3].split(",")
-y,m,d=map(int,exp.split("-"))
-yy=str(y%100).zfill(2); mm=str(m).zfill(2); dd=str(d).zfill(2)
+import sys
+exp,right,sl=sys.argv[1],sys.argv[2],sys.argv[3].split(",")
+y,m,d=exp.split("-"); sy=y[2:]; mm=m.zfill(2); dd=d.zfill(2)
 out=[]
-for s in strikes:
+for s in sl:
     k=int(s)
-    occ=f"SPY{yy}{mm}{dd}{'C' if right=='call' else 'P'}{int(k*1000):08d}"
-    out.append(occ)
+    out.append(f"SPY{sy}{mm}{dd}{'C' if right=='call' else 'P'}{int(k*1000):08d}")
 print(",".join(out))
 PY
  "$EXP" "$RIGHT" "$strikes")
 
-          # snapshots (if not available, bail)
           SNAP=$(curl -sS "$DATA/v1beta1/options/snapshots?symbols=$(printf %s "$SYMS" | sed 's/,/%2C/g')" \
-                    -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" || true)
+                   -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" || true)
           ok=$(echo "$SNAP" | jq -r 'has("snapshots")')
-          [ "$ok" != "true" ] && { echo "Options snapshots not available on plan; skipping."; exit 0; }
+          [ "$ok" != "true" ] && { echo "no options snapshots on plan; exit"; exit 0; }
 
-          # pick best by: delta in range, OI/Vol min, min spread pct
-          best=$(echo "$SNAP" | jq -r --argjson dmin $TARGET_DELTA_MIN --argjson dmax $TARGET_DELTA_MAX \
-                                --argjson moi $MIN_OI --argjson mvol $MIN_VOL --argjson msp $MAX_SPREAD_PCT '
-              .snapshots
-              | to_entries
-              | map(
-                  .key as $sym
-                  | .value as $s
-                  | ($s.greeks.delta // null) as $delta
-                  | ($s.latestQuote | {bp,ap}) as $q
-                  | ($s.latestTrade.p // null) as $ltp
-                  | ($s.dailyBar.v // 0) as $vol
-                  | ($s.greek?.theta // 0) as $th
-                  | ($s.details.openInterest // 0) as $oi
-                  | if ($delta==null or $q.bp==null or $q.ap==null) then empty else
-                      (.spread := ( ($q.ap - $q.bp) / ( ($q.ap + $q.bp)/2.0 ) ) )
-                      | select($delta>=$dmin and $delta<=$dmax and $oi>=$moi and $vol>=$mvol and .spread <= $msp)
-                      | {sym:$sym, delta:$delta, bp:$q.bp, ap:$q.ap, mid: (($q.ap + $q.bp)/2.0), spread:.spread, oi:$oi, vol:$vol}
-                    end
-                )
-              | sort_by(.spread) | first
+          best=$(echo "$SNAP" | jq -r --argjson dmin ${{ env.TARGET_DELTA_MIN }} --argjson dmax ${{ env.TARGET_DELTA_MAX }} \
+                                   --argjson moi ${{ env.MIN_OI }} --argjson mvol ${{ env.MIN_VOL }} --argjson msp ${{ env.MAX_SPREAD_PCT }} '
+            .snapshots|to_entries
+            | map( .key as $sym
+                 | .value as $s
+                 | ($s.greeks.delta // null) as $d
+                 | ($s.latestQuote | {bp,ap}) as $q
+                 | ($s.details.openInterest // 0) as $oi
+                 | ($s.dailyBar.v // 0) as $vol
+                 | if ($d==null or $q.bp==null or $q.ap==null) then empty else
+                     (.spread := ( ($q.ap-$q.bp) / ( ($q.ap+$q.bp)/2.0 ) ))
+                     | select($d>=$dmin and $d<=$dmax and $oi>=$moi and $vol>=$mvol and .spread <= $msp)
+                     | {sym:$sym, delta:$d, mid:(($q.ap+$q.bp)/2.0), spread:.spread}
+                   end)
+            | sort_by(.spread) | first
           ')
-
-          [ -z "$best" ] && { echo "No contract passed filters; skipping."; exit 0; }
+          [ -z "$best" ] && { echo "no contract passed filters"; exit 0; }
 
           SYM=$(echo "$best" | jq -r '.sym')
           MID=$(echo "$best" | jq -r '.mid')
 
-          # account equity for sizing
-          ACCT=$(curl -sS "$TRADING/v2/account" -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
+          # sizing by equity
+          ACCT=$(curl -sS "$TRD/v2/account" -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
           EQ=$(echo "$ACCT" | jq -r '.equity | tonumber')
-
-          # size: risk-based (assume max loss ~ premium)
-          # qty = floor( (equity * RISK_PCT) / (mid * 100) ), 100x multiplier
           QTY=$(python3 - <<PY
 import math,sys
 eq=float(sys.argv[1]); rp=float(sys.argv[2]); mid=float(sys.argv[3])
 qty=math.floor( (eq*rp) / (max(mid,0.01)*100.0) )
 print(max(qty,1))
 PY
- "$EQ" "$RISK_PCT" "$MID")
+ "$EQ" "${{ env.RISK_PCT }}" "$MID")
 
-          # ladder IOC: mid, then mid + 0.01, mid + 0.02 (calls buy; puts buy too—direction is via option right)
-          # Alpaca options order: POST /v2/options/orders
-          for step in 0 0.01 0.02; do
+          # enforce tiny accounts: at least $200 free cash for one contract
+          CASH_OK=$(python3 - <<PY
+import sys
+eq=float(sys.argv[1]); mid=float(sys.argv[2])
+need=mid*100.0
+print( int(eq*0.2 >= need) )  # crude guard: require 20% of equity >= premium
+PY
+ "$EQ" "$MID")
+          [ "$CASH_OK" = "0" ] && { echo "cash guard failed (too small for premium)"; exit 0; }
+
+          TAG="${{ env.CLIENT_TAG }}-$(date +%Y%m%d)-$SYM"
+          OPENED=""
+          for inc in 0 0.01 0.02; do
             LMT=$(python3 - <<PY
 import sys
 mid=float(sys.argv[1]); inc=float(sys.argv[2])
 print(round(mid+inc,2))
 PY
- "$MID" "$step")
-            echo "Trying IOC at $LMT for $SYM x $QTY"
-            ORD=$(curl -sS -X POST "$TRADING/v2/options/orders" \
+ "$MID" "$inc")
+            echo "IOC try $SYM @ $LMT x $QTY"
+            ORD=$(curl -sS -X POST "$TRD/v2/options/orders" \
                     -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" -H "Content-Type: application/json" \
-                    -d "$(jq -n --arg sym "$SYM" --arg lmt "$LMT" --arg qty "$QTY" \
-                          '{symbol:$sym, qty:$qty, side:"buy", type:"limit", time_in_force:"ioc", limit_price:$lmt}')" || true)
+                    -d "$(jq -n --arg sym "$SYM" --arg lmt "$LMT" --arg qty "$QTY" --arg cid "$TAG" \
+                          '{symbol:$sym, qty:$qty, side:"buy", type:"limit", time_in_force:"ioc", client_order_id:$cid, limit_price:$lmt}')" || true)
             st=$(echo "$ORD" | jq -r '.status // empty')
             id=$(echo "$ORD" | jq -r '.id // empty')
-            echo "Order status: $st id: $id"
+            echo "status=$st id=$id"
             if [ "$st" = "accepted" ] || [ "$st" = "filled" ] || [ "$st" = "new" ] || [ "$st" = "partially_filled" ]; then
-              echo "opened_id=$id" >> "$GITHUB_OUTPUT"
-              echo "opened_sym=$SYM" >> "$GITHUB_OUTPUT"
-              echo "opened_mid=$MID" >> "$GITHUB_OUTPUT"
-              break
+              OPENED="$id"; break
             fi
             sleep 2
           done
+          [ -n "$OPENED" ] && echo "opened_id=$OPENED" >> "$GITHUB_OUTPUT"
+          echo "opened_tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      # (Optional) You can add a trailing/partials management job here once fills are confirmed
+      - name: Announce entry (if any)
+        if: ${{ steps.entry.outputs.opened_tag != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.MAIL_USERNAME }}
+          from: "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
+          subject: Entry tag ${{ steps.entry.outputs.opened_tag }}
+          body: |
+            Open attempt complete. Tag: ${{ steps.entry.outputs.opened_tag }}
+            Order id (if any): ${{ steps.entry.outputs.opened_id }}
