@@ -1,6 +1,6 @@
 # app.py
-import os, time
-from typing import Optional
+import os, time, math
+from typing import Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -29,6 +29,11 @@ HDR = {
 UP_THR   =  0.0035
 DOWN_THR = -0.0035
 
+# Regime defaults (can be tuned)
+REG_MIN_ABS_GAP = 0.0020     # 0.20%
+REG_MIN_VIX_PCT = 0.02       # +2% for longs, -2% for shorts (sign-aware in code)
+REG_MIN_ATR_PCT = 0.0080     # 0.80% of prior close
+
 # In-memory cache
 _HIST_DF: Optional[pd.DataFrame] = None
 _HIST_TS: float = 0.0
@@ -39,11 +44,11 @@ _MODEL_TS: float = 0.0
 # Rebuild after this many seconds (12 hours)
 REFRESH_SECS = 12 * 3600
 
-# Flags to expose whether we used a fallback path
+# Fallback flags (exposed in response)
 _LAST_HISTORY_FALLBACK = False
 _LAST_MODEL_FALLBACK = False
 
-app = FastAPI(title="SPY Preopen API", version="0.2.0")
+app = FastAPI(title="SPY Preopen API", version="0.3.0")
 
 
 # -------------------- Schemas --------------------
@@ -61,7 +66,7 @@ def healthz():
         "uptime_seconds": round(time.time() - APP_STARTED_AT, 2),
         "model_cached": _CLF is not None,
         "history_cached": _HIST_DF is not None,
-        "version": "0.2.0",
+        "version": "0.3.0",
     }
 
 @app.get("/health")
@@ -117,11 +122,10 @@ def build_history() -> pd.DataFrame:
         return _HIST_DF
 
     spy = yf.download("SPY", start="2012-01-01", auto_adjust=False, progress=False)
-    vix = yf.download("VIXY", start="2012-01-01", auto_adjust=False, progress=False)
+    vix = yf.download("^VIX", start="2012-01-01", auto_adjust=False, progress=False)  # better VIX series
     es  = yf.download("ES=F",  start="2012-01-01", auto_adjust=False, progress=False)
 
     if spy.empty or vix.empty or es.empty:
-        # Minimal synthetic two-row frame (enough for the dummy fallback model)
         now = pd.Timestamp.utcnow().floor("D")
         df = pd.DataFrame(
             {
@@ -137,6 +141,8 @@ def build_history() -> pd.DataFrame:
         spy = spy.rename(columns=str.title)
         df = pd.DataFrame(index=spy.index)
         df["Open"]      = spy["Open"]
+        df["High"]      = spy["High"]
+        df["Low"]       = spy["Low"]
         df["Close"]     = spy["Close"]
         df["VIX_Close"] = vix["Close"].reindex(df.index).ffill()
         df["ES_Close"]  = es["Close"].reindex(df.index).ffill()
@@ -152,20 +158,27 @@ def build_history() -> pd.DataFrame:
           np.where(oc_ret <= DOWN_THR, "Down", "Sideways"))
     df["label"] = lab
 
-    df = df.dropna(subset=["ES_overnight_ret", "VIX_overnight_ret", "Premarket_Gap"])
+    # Daily ATR% using prior 10 sessions
+    tr = np.maximum(df["High"] - df["Low"], np.maximum(abs(df["High"] - df["Close"].shift(1)), abs(df["Low"] - df["Close"].shift(1))))
+    df["ATR10"] = pd.Series(tr).rolling(10).mean()
+    df["ATR10_pct"] = df["ATR10"] / df["Close"].shift(1)
 
-    # If real data dropped everything (can happen), keep a tiny synthetic fallback
+    df = df.dropna(subset=["ES_overnight_ret", "VIX_overnight_ret", "Premarket_Gap", "ATR10_pct"])
+
     if df.empty:
         now = pd.Timestamp.utcnow().floor("D")
         df = pd.DataFrame(
             {
                 "Open":              [500.0, 501.0],
+                "High":              [502.0, 503.0],
+                "Low":               [498.0, 500.0],
                 "Close":             [501.0, 502.0],
                 "VIX_Close":         [15.0,  15.1],
                 "ES_Close":          [5200.0, 5205.0],
                 "ES_overnight_ret":  [0.0,  (5205.0/5200.0 - 1.0)],
                 "VIX_overnight_ret": [0.0,  (15.1/15.0 - 1.0)],
                 "Premarket_Gap":     [0.0,  (501.0/501.0 - 1.0)],
+                "ATR10_pct":         [0.01, 0.01],
                 "label":             ["Sideways", "Sideways"],
             },
             index=[now - pd.Timedelta(days=1), now],
@@ -179,7 +192,7 @@ def build_history() -> pd.DataFrame:
 def train_quick(df: pd.DataFrame):
     """
     Train a GradientBoostingClassifier like the notebook.
-    Falls back to a DummyClassifier when history is tiny.
+    Falls back to DummyClassifier when history is tiny.
     Caches the model for REFRESH_SECS.
     """
     global _CLF, _FEAT_NAMES, _MODEL_TS, _LAST_MODEL_FALLBACK
@@ -191,17 +204,14 @@ def train_quick(df: pd.DataFrame):
     X = df[["ES_overnight_ret", "VIX_overnight_ret", "Premarket_Gap"]].copy()
     y = df["label"].copy()
 
-    # If we have very few rows, use a safe dummy model
     if len(X) < 3:
         from sklearn.dummy import DummyClassifier
         dummy = DummyClassifier(strategy="most_frequent")
-        # Fit on a single fake row just to satisfy scikit-learn's API
         dummy.fit(np.zeros((1, 3)), ["Sideways"])
         _CLF, _FEAT_NAMES, _MODEL_TS = dummy, X.columns.tolist(), time.time()
         _LAST_MODEL_FALLBACK = True
         return _CLF, _FEAT_NAMES
 
-    # Ensure n_splits < n_samples to avoid the “folds > samples” error
     n_splits = max(2, min(6, len(X) - 1))
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
@@ -223,7 +233,7 @@ def root():
 
 @app.post("/predict")
 def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
-    # Optional bearer token (set API_TOKEN in Render if you want protection)
+    # Optional bearer token
     if API_TOKEN:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "Missing Bearer token")
@@ -231,19 +241,18 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
             raise HTTPException(403, "Invalid token")
 
     try:
-        # Cache-aware history + model
         df_hist = build_history()
         clf, feat_names = train_quick(df_hist)
 
         # Live features
         spy_last  = latest_trade("SPY")
-        vixy_last = latest_trade("VIXY")
+        vix_last  = latest_trade("VIXY") if not (ALPACA_API_KEY and ALPACA_SECRET_KEY) else latest_trade("VIXY")
         spy_yday  = prev_close("SPY")
-        vixy_yday = prev_close("VIXY")
+        vix_yday  = prev_close("VIXY")
 
         premarket_gap  = (spy_last / spy_yday) - 1.0
-        vix_overnight  = (vixy_last / vixy_yday) - 1.0
-        es_overnight   = df_hist["ES_overnight_ret"].iloc[-1]  # proxy same as notebook
+        vix_overnight  = (vix_last / vix_yday) - 1.0
+        es_overnight   = df_hist["ES_overnight_ret"].iloc[-1]
 
         x_live = pd.DataFrame([{
             "ES_overnight_ret":  es_overnight,
@@ -257,6 +266,33 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
         pred = conf_series.index[0]
         p = float(conf_series.iloc[0])
 
+        # Regime metrics from history + live
+        atr_pct = float(df_hist["ATR10_pct"].iloc[-1])
+        gap_abs = abs(float(premarket_gap))
+        vix_pct = float(vix_overnight)
+
+        # Direction-aware vix threshold:
+        # longs expect +VIX change small or negative; to keep simple we require magnitude
+        vix_ok_long  = (vix_pct <= 0.0) or (vix_pct >= REG_MIN_VIX_PCT)
+        vix_ok_short = (vix_pct >= 0.0) or (abs(vix_pct) >= REG_MIN_VIX_PCT)
+
+        if pred == "Up":
+            vix_ok = vix_ok_long
+        elif pred == "Down":
+            vix_ok = vix_ok_short
+        else:
+            vix_ok = False  # avoid Sideways anyway
+
+        regime = {
+            "gap_abs": round(gap_abs, 6),
+            "atr10_pct": round(atr_pct, 6),
+            "vix_pct": round(vix_pct, 6),
+            "gap_ok": gap_abs >= REG_MIN_ABS_GAP,
+            "atr_ok": atr_pct >= REG_MIN_ATR_PCT,
+            "vix_ok": vix_ok,
+        }
+        regime_pass = bool(regime["gap_ok"] and regime["atr_ok"] and regime["vix_ok"] and pred != "Sideways")
+
         guidance = (
             "OK: Meets confidence & not Sideways."
             if pred != "Sideways" and p >= 0.60
@@ -267,7 +303,6 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
             )
         )
 
-        # Indicate whether fallback paths were used
         mode = {
             "history_fallback": _LAST_HISTORY_FALLBACK,
             "model_fallback": _LAST_MODEL_FALLBACK,
@@ -281,6 +316,8 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
                 "vix_overnight_ret": round(float(vix_overnight), 6),
                 "es_overnight_ret": round(float(es_overnight), 6),
             },
+            "regime": regime,
+            "regime_pass": regime_pass,
             "guidance": guidance,
             "mode": mode,
             "cold_start_seconds": round(time.time() - APP_STARTED_AT, 2),
@@ -290,5 +327,4 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
     except HTTPException:
         raise
     except Exception as e:
-        # surface a clean error instead of HTML
         raise HTTPException(status_code=500, detail=str(e))
