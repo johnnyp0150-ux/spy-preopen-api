@@ -2,8 +2,8 @@ name: SPY Preopen Trigger
 
 on:
   schedule:
-    # 6:25 AM Pacific (DST). Change to '25 14 * * 1-5' after clocks fall back.
-    - cron: '25 13 * * 1-5'
+    # 6:20 AM Pacific (DST). Change to '20 14 * * 1-5' after clocks fall back.
+    - cron: '20 13 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -12,14 +12,22 @@ jobs:
     env:
       API_URL: https://spy-preopen-api.onrender.com/predict
       # --- policy knobs ---
-      MIN_CONF: "0.60"          # require >= 0.60 confidence to trade
-      ALLOW_SIDEWAYS: "false"   # require NOT Sideways to trade
-      # --- optional trade webhook (Zapier/Make/your server) ---
-      TRADE_WEBHOOK_URL: ${{ secrets.TRADE_WEBHOOK_URL }}  # leave empty to disable
+      MIN_CONF: "0.60"
+      ALLOW_SIDEWAYS: "false"
+      # --- optional trade webhook (leave empty if unused) ---
+      TRADE_WEBHOOK_URL: ${{ secrets.TRADE_WEBHOOK_URL }}
+      # --- Alpaca paper-trading ---
+      ALPACA_BASE: https://paper-api.alpaca.markets
+      ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
 
     steps:
       - name: Install jq (JSON)
         run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Warm API (healthz)
+        run: |
+          curl -sS -m 10 https://spy-preopen-api.onrender.com/healthz || true
 
       - name: Call SPY API (with retries)
         id: call
@@ -27,22 +35,15 @@ jobs:
         run: |
           set -euo pipefail
           echo "Pinging $API_URL ..."
-
           RES=""
           for i in {1..5}; do
             RES=$(curl -sS -m 25 -X POST "$API_URL" -H "Content-Type: application/json" -d '{}') || true
-            # break if valid JSON with required keys
             if echo "$RES" | jq -e 'has("model_call") and has("confidence")' >/dev/null 2>&1; then
               break
             fi
-            echo "Attempt $i not JSON (or missing fields). Sleeping 6s…"
+            echo "Attempt $i not JSON. Sleeping 6s…"
             sleep 6
           done
-
-          echo "First 200 chars:"
-          echo "$RES" | head -c 200; echo
-
-          # Export minified JSON as a single line (safest for outputs)
           JSON_MIN=$(echo "$RES" | jq -c . 2>/dev/null || echo '')
           if [ -z "$JSON_MIN" ]; then
             echo "JSON_MIN empty; failing fast."
@@ -55,23 +56,17 @@ jobs:
         shell: bash
         run: |
           JSON='${{ steps.call.outputs.res }}'
-          echo "Raw JSON:"
-          echo "$JSON" | jq .
-
           MODEL=$(echo "$JSON" | jq -r '.model_call // "UNKNOWN"')
           CONF=$(echo "$JSON" | jq -r '.confidence // 0')
           GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance"')
           FEAT=$(echo "$JSON" | jq -c '.features // {}')
 
-          # decision rules
           MIN_CONF="${MIN_CONF}"
           ALLOW_SIDEWAYS="${ALLOW_SIDEWAYS}"
 
           SHOULD_TRADE="false"
           if [ "$MODEL" != "UNKNOWN" ]; then
-            # confidence check
             CONF_OK=$(awk -v a="$CONF" -v b="$MIN_CONF" 'BEGIN{print (a>=b)?"1":"0"}')
-            # sideways filter
             SIDEWAYS_OK="1"
             if [ "$ALLOW_SIDEWAYS" = "false" ] && [ "$MODEL" = "Sideways" ]; then
               SIDEWAYS_OK="0"
@@ -84,8 +79,6 @@ jobs:
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
           echo "conf=$CONF" >> "$GITHUB_OUTPUT"
           echo "should_trade=$SHOULD_TRADE" >> "$GITHUB_OUTPUT"
-
-          # email outputs
           echo "subject=SPY Pre-Open: $MODEL (conf $CONF)" >> "$GITHUB_OUTPUT"
           printf "body<<EOF\nDirection: %s\nConfidence: %s\nGuidance: %s\nFeatures: %s\nTime: %s\nEOF\n" \
             "$MODEL" "$CONF" "$GUID" "$FEAT" "${{ github.run_started_at }}" >> "$GITHUB_OUTPUT"
@@ -104,11 +97,26 @@ jobs:
           subject: ${{ steps.prep.outputs.subject }}
           body: ${{ steps.prep.outputs.body }}
 
-      - name: (Optional) Fire trade webhook if policy passes
-        if: ${{ steps.prep.outputs.should_trade == 'true' && env.TRADE_WEBHOOK_URL != '' }}
+      - name: Place Alpaca paper trade (if policy passes)
+        if: ${{ steps.prep.outputs.should_trade == 'true' && env.ALPACA_KEY_ID != '' && env.ALPACA_SECRET_KEY != '' }}
         shell: bash
         run: |
           JSON='${{ steps.call.outputs.res }}'
-          curl -sS -X POST "$TRADE_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "$JSON" | sed -e 's/./&/120' -e 'q'
+          MODEL=$(echo "$JSON" | jq -r '.model_call')
+          if [ "$MODEL" = "Up" ]; then
+            echo "Placing paper BUY 1 SPY (market) via Alpaca…"
+            curl -sS -X POST "$ALPACA_BASE/v2/orders" \
+              -H "APCA-API-KEY-ID: $ALPACA_KEY_ID" \
+              -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{"symbol":"SPY","qty":"1","side":"buy","type":"market","time_in_force":"day"}' | jq .
+          elif [ "$MODEL" = "Down" ]; then
+            echo "Placing paper SELL 1 SPY (market) via Alpaca…"
+            curl -sS -X POST "$ALPACA_BASE/v2/orders" \
+              -H "APCA-API-KEY-ID: $ALPACA_KEY_ID" \
+              -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{"symbol":"SPY","qty":"1","side":"sell","type":"market","time_in_force":"day"}' | jq .
+          else
+            echo "Model=$MODEL not actionable."
+          fi
