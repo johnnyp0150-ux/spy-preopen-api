@@ -1,5 +1,5 @@
 # app.py
-import os, time, math, json
+import os, time, math
 from typing import Optional, Dict, Any
 
 import numpy as np
@@ -14,38 +14,39 @@ from sklearn.ensemble import GradientBoostingClassifier
 # -------------------- Config & Globals --------------------
 APP_STARTED_AT = time.time()
 
-# Render / env secrets
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-API_TOKEN         = os.getenv("API_TOKEN", "")  # optional bearer check
+API_TOKEN         = os.getenv("API_TOKEN", "")  # optional Bearer check
 
-# Trading config
-MARKET_DATA_BASE = "https://data.alpaca.markets/v2"
+# Alpaca endpoints (paper by default)
 ALPACA_TRADE_BASE = os.getenv("ALPACA_TRADE_BASE", "https://paper-api.alpaca.markets")
+ALPACA_DATA_BASE  = os.getenv("ALPACA_DATA_BASE",  "https://data.alpaca.markets")
 
-# Trade mode: "EQUITY" (default) or "OPTIONS"
-TRADE_MODE = os.getenv("TRADE_MODE", "EQUITY").upper()
+TRADE_BASE_STOCKS = f"{ALPACA_DATA_BASE}/v2"  # for latest trade fallback
+HDR = {
+    "APCA-API-KEY-ID": ALPACA_API_KEY or "",
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY or "",
+}
 
-# Thresholds (same as notebook)
+# Notebook thresholds
 UP_THR   =  0.0035
 DOWN_THR = -0.0035
 
-# Regime defaults (can be tuned)
-REG_MIN_ABS_GAP = 0.0020     # 0.20%
-REG_MIN_VIX_PCT = 0.02       # +2% (magnitude)
-REG_MIN_ATR_PCT = 0.0080     # 0.80% of prior close
+# Regime gates
+REG_MIN_ABS_GAP = float(os.getenv("REG_MIN_ABS_GAP", "0.0020"))  # 0.20%
+REG_MIN_VIX_PCT = float(os.getenv("REG_MIN_VIX_PCT", "0.0200"))  # 2% (magnitude, direction-aware below)
+REG_MIN_ATR_PCT = float(os.getenv("REG_MIN_ATR_PCT", "0.0080"))  # 0.80%
 
-# In-memory cache
+# In-memory caches
 _HIST_DF: Optional[pd.DataFrame] = None
 _HIST_TS: float = 0.0
 _CLF = None
 _FEAT_NAMES = None
 _MODEL_TS: float = 0.0
 
-# Rebuild after this many seconds (12 hours)
 REFRESH_SECS = 12 * 3600
 
-# Fallback flags (exposed in response)
+# Fallback flags (reported in responses)
 _LAST_HISTORY_FALLBACK = False
 _LAST_MODEL_FALLBACK = False
 
@@ -56,11 +57,20 @@ app = FastAPI(title="SPY Preopen API", version="0.4.0")
 class PredictIn(BaseModel):
     test_value: Optional[int] = None
 
+class TradeIn(BaseModel):
+    # This endpoint does NOT place options directly; it prepares a clean payload
+    # and (optionally) hits your TRADE_WEBHOOK_URL so your workflow can place the order.
+    # If you flip ENABLE_EQUITY_PROOF in Actions, it can submit a 1-share SPY paper trade via Alpaca as a sanity check.
+    model_call: str
+    confidence: float
+    features: Dict[str, float]
+    regime: Dict[str, Any]
+    regime_pass: bool
+
 
 # -------------------- Health --------------------
 @app.get("/healthz")
 def healthz():
-    """Lightweight liveness/readiness probe (no external calls)."""
     return {
         "status": "ok",
         "uptime_seconds": round(time.time() - APP_STARTED_AT, 2),
@@ -74,43 +84,37 @@ def health():
     return healthz()
 
 
-# -------------------- Helpers (data & model) --------------------
+# -------------------- Helpers --------------------
 def _need_refresh(ts: float) -> bool:
     return (time.time() - ts) > REFRESH_SECS
 
 
-def alpaca_headers() -> Dict[str, str]:
-    return {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-        "Content-Type": "application/json",
-    }
+def _have_alpaca_keys() -> bool:
+    return bool(ALPACA_API_KEY and ALPACA_SECRET_KEY)
 
 
 def latest_trade(symbol: str) -> float:
     """
-    Live last trade:
-      • Use Alpaca market data if keys are present
-      • Fallback to yfinance intraday if not
+    Latest trade:
+      • Use Alpaca (if keys present) via /v2/stocks/{symbol}/trades/latest
+      • Else fallback to yfinance 1-minute intraday
     """
-    if ALPACA_API_KEY and ALPACA_SECRET_KEY:
-        url = f"{MARKET_DATA_BASE}/stocks/{symbol}/trades/latest"
-        r = requests.get(url, headers=alpaca_headers(), timeout=20)
+    if _have_alpaca_keys():
+        url = f"{TRADE_BASE_STOCKS}/stocks/{symbol}/trades/latest"
+        r = requests.get(url, headers=HDR, timeout=20)
         if r.status_code == 401:
             raise HTTPException(502, "Alpaca auth failed (check keys)")
         r.raise_for_status()
         return float(r.json()["trade"]["p"])
 
-    # Fallback: yfinance 1m bars for the current day
     t = yf.Ticker(symbol)
     df = t.history(period="1d", interval="1m")
     if df.empty:
-        raise HTTPException(502, f"Could not fetch intraday for {symbol} via yfinance.")
+        raise HTTPException(502, f"Could not fetch intraday for {symbol}.")
     return float(df["Close"].iloc[-1])
 
 
 def prev_close(symbol: str) -> float:
-    """Yesterday close via yfinance (robust & free)."""
     df = yf.download(symbol, period="5d", auto_adjust=False, progress=False)
     if df.empty or len(df) < 2:
         raise HTTPException(502, f"Could not fetch recent history for {symbol}.")
@@ -118,11 +122,6 @@ def prev_close(symbol: str) -> float:
 
 
 def build_history() -> pd.DataFrame:
-    """
-    Historical feature/label frame used for training.
-    Falls back to a tiny synthetic frame if downloads are empty so the API never 500s.
-    Caches the result for REFRESH_SECS.
-    """
     global _HIST_DF, _HIST_TS, _LAST_HISTORY_FALLBACK
     _LAST_HISTORY_FALLBACK = False
 
@@ -157,21 +156,19 @@ def build_history() -> pd.DataFrame:
         df["VIX_Close"] = vix["Close"].reindex(df.index).ffill()
         df["ES_Close"]  = es["Close"].reindex(df.index).ffill()
 
-    # Features used in your notebook
+    # Features
     df["ES_overnight_ret"]  = df["ES_Close"].pct_change()
     df["VIX_overnight_ret"] = df["VIX_Close"].pct_change()
     df["Premarket_Gap"]     = (df["Open"] - df["Close"].shift(1)) / df["Close"].shift(1)
 
-    # Labels (Up / Down / Sideways) from thresholds
+    # Labels
     oc_ret = (df["Close"] / df["Close"].shift(1)) - 1.0
-    lab = np.where(oc_ret >= UP_THR, "Up",
-          np.where(oc_ret <= DOWN_THR, "Down", "Sideways"))
-    df["label"] = lab
+    df["label"] = np.where(oc_ret >= UP_THR, "Up",
+                   np.where(oc_ret <= DOWN_THR, "Down", "Sideways"))
 
-    # Daily ATR% using prior 10 sessions
+    # ATR(10) %
     tr = np.maximum(df["High"] - df["Low"],
-                    np.maximum(abs(df["High"] - df["Close"].shift(1)),
-                               abs(df["Low"]  - df["Close"].shift(1))))
+         np.maximum(abs(df["High"] - df["Close"].shift(1)), abs(df["Low"] - df["Close"].shift(1))))
     df["ATR10"] = pd.Series(tr).rolling(10).mean()
     df["ATR10_pct"] = df["ATR10"] / df["Close"].shift(1)
 
@@ -187,9 +184,9 @@ def build_history() -> pd.DataFrame:
                 "Close":             [501.0, 502.0],
                 "VIX_Close":         [15.0,  15.1],
                 "ES_Close":          [5200.0, 5205.0],
-                "ES_overnight_ret":  [0.0,  (5205.0/5200.0 - 1.0)],
+                "ES_overnight_ret":  [0.0,  (5205/5200 - 1.0)],
                 "VIX_overnight_ret": [0.0,  (15.1/15.0 - 1.0)],
-                "Premarket_Gap":     [0.0,  (501.0/501.0 - 1.0)],
+                "Premarket_Gap":     [0.0,  0.0],
                 "ATR10_pct":         [0.01, 0.01],
                 "label":             ["Sideways", "Sideways"],
             },
@@ -202,11 +199,6 @@ def build_history() -> pd.DataFrame:
 
 
 def train_quick(df: pd.DataFrame):
-    """
-    Train a GradientBoostingClassifier like the notebook.
-    Falls back to DummyClassifier when history is tiny.
-    Caches the model for REFRESH_SECS.
-    """
     global _CLF, _FEAT_NAMES, _MODEL_TS, _LAST_MODEL_FALLBACK
     _LAST_MODEL_FALLBACK = False
 
@@ -237,7 +229,7 @@ def train_quick(df: pd.DataFrame):
     return _CLF, _FEAT_NAMES
 
 
-# -------------------- Prediction Route --------------------
+# -------------------- Routes --------------------
 @app.get("/")
 def root():
     return {"ok": True, "msg": "See /docs for interactive API. Health: /healthz"}
@@ -245,7 +237,6 @@ def root():
 
 @app.post("/predict")
 def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
-    # Optional bearer token
     if API_TOKEN:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "Missing Bearer token")
@@ -256,15 +247,14 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
         df_hist = build_history()
         clf, feat_names = train_quick(df_hist)
 
-        # Live features
         spy_last  = latest_trade("SPY")
-        vix_last  = latest_trade("VIXY")
+        vixy_last = latest_trade("VIXY")  # cheap proxy for “VIX-ish” change when keys absent
         spy_yday  = prev_close("SPY")
-        vix_yday  = prev_close("VIXY")
+        vixy_yday = prev_close("VIXY")
 
         premarket_gap  = (spy_last / spy_yday) - 1.0
-        vix_overnight  = (vix_last / vix_yday) - 1.0
-        es_overnight   = df_hist["ES_overnight_ret"].iloc[-1]
+        vix_overnight  = (vixy_last / vixy_yday) - 1.0
+        es_overnight   = float(df_hist["ES_overnight_ret"].iloc[-1])
 
         x_live = pd.DataFrame([{
             "ES_overnight_ret":  es_overnight,
@@ -278,14 +268,14 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
         pred = conf_series.index[0]
         p = float(conf_series.iloc[0])
 
-        # Regime metrics
+        # Regime gates
         atr_pct = float(df_hist["ATR10_pct"].iloc[-1])
         gap_abs = abs(float(premarket_gap))
         vix_pct = float(vix_overnight)
 
         vix_ok_long  = (vix_pct <= 0.0) or (abs(vix_pct) >= REG_MIN_VIX_PCT)
         vix_ok_short = (vix_pct >= 0.0) or (abs(vix_pct) >= REG_MIN_VIX_PCT)
-        vix_ok = vix_ok_long if pred == "Up" else vix_ok_short if pred == "Down" else False
+        vix_ok = vix_ok_long if pred == "Up" else (vix_ok_short if pred == "Down" else False)
 
         regime = {
             "gap_abs": round(gap_abs, 6),
@@ -301,13 +291,11 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
             "OK: Meets confidence & not Sideways."
             if pred != "Sideways" and p >= 0.60
             else ("Guardrail: Sideways day predicted. Consider standing down."
-                  if pred == "Sideways" else "Guardrail: low confidence. Consider NOT trading.")
+                  if pred == "Sideways"
+                  else "Guardrail: low confidence. Consider NOT trading.")
         )
 
-        mode = {
-            "history_fallback": _LAST_HISTORY_FALLBACK,
-            "model_fallback": _LAST_MODEL_FALLBACK,
-        }
+        mode = {"history_fallback": _LAST_HISTORY_FALLBACK, "model_fallback": _LAST_MODEL_FALLBACK}
 
         return {
             "model_call": pred,
@@ -331,162 +319,34 @@ def predict(payload: PredictIn, authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# -------------------- Trade Helpers --------------------
-def _next_friday_yyyy_mm_dd(ts: Optional[pd.Timestamp] = None) -> str:
-    """Return next Friday in YYYY-MM-DD (for options expiration)."""
-    if ts is None:
-        ts = pd.Timestamp.utcnow().tz_localize("UTC")
-    weekday = ts.weekday()  # Mon=0 ... Sun=6
-    days_ahead = (4 - weekday) % 7
-    if days_ahead == 0:  # today is Friday -> use today
-        days_ahead = 0
-    exp = (ts + pd.Timedelta(days=days_ahead)).date().isoformat()
-    return exp
-
-
-def _place_equity_order(symbol: str, side: str, qty: int = 1) -> Dict[str, Any]:
-    """Simple market day order for equities."""
-    url = f"{ALPACA_TRADE_BASE}/v2/orders"
-    payload = {
-        "symbol": symbol,
-        "qty": str(qty),
-        "side": side,
-        "type": "market",
-        "time_in_force": "day",
-        "client_order_id": f"SPYBOT-{symbol}-{side}-{int(time.time())}"
-    }
-    r = requests.post(url, headers=alpaca_headers(), data=json.dumps(payload), timeout=20)
-    return {"status_code": r.status_code, "json": _safe_json(r)}
-
-
-def _safe_json(r: requests.Response):
-    try:
-        return r.json()
-    except Exception:
-        return {"text": r.text}
-
-
-def _nearest_atm_strike(spot: float, increment: float = 1.0) -> float:
-    """Round to nearest strike increment (e.g., 1.0 for SPY)."""
-    return round(spot / increment) * increment
-
-
-def _pick_option_symbol_via_contracts(underlying: str, call_or_put: str, spot: float) -> Optional[str]:
-    """
-    Query Alpaca options contracts and pick an ATM contract expiring next Friday.
-    Returns OCC symbol like 'SPY240111C00500000' or None if not found.
-    """
-    exp = _next_friday_yyyy_mm_dd()
-    strike = _nearest_atm_strike(spot, 1.0)
-
-    # Alpaca contracts endpoint
-    url = f"{ALPACA_TRADE_BASE}/v2/options/contracts"
-    params = {
-        "underlying_symbols": underlying,
-        "expiration_date": exp,
-        "type": "call" if call_or_put.lower().startswith("c") else "put",
-        "status": "active",
-        "limit": 200
-    }
-    r = requests.get(url, headers=alpaca_headers(), params=params, timeout=20)
-    if r.status_code != 200:
-        return None
-
-    data = r.json()
-    contracts = data.get("contracts") or []
-
-    # Choose the contract whose strike is closest to spot
-    best_sym = None
-    best_diff = 1e9
-    for c in contracts:
-        try:
-            k = float(c.get("strike_price"))
-            sym = c.get("symbol")
-            d = abs(k - strike)
-            if d < best_diff:
-                best_diff, best_sym = d, sym
-        except Exception:
-            continue
-    return best_sym
-
-
-def _place_option_order(symbol: str, side: str, qty: int = 1) -> Dict[str, Any]:
-    """Place a simple market order for an options contract."""
-    url = f"{ALPACA_TRADE_BASE}/v2/options/orders"
-    payload = {
-        "symbol": symbol,
-        "qty": str(qty),
-        "side": side,          # "buy" or "sell"
-        "type": "market",
-        "time_in_force": "day",
-        "client_order_id": f"SPYBOT-OPT-{symbol}-{side}-{int(time.time())}"
-    }
-    r = requests.post(url, headers=alpaca_headers(), data=json.dumps(payload), timeout=20)
-    return {"status_code": r.status_code, "json": _safe_json(r)}
-
-
-# -------------------- Trade Route --------------------
 @app.post("/trade")
-def trade(payload: Dict[str, Any],
-          authorization: Optional[str] = Header(None)):
+def trade(body: TradeIn, authorization: Optional[str] = Header(None)):
     """
-    Minimal automated trade endpoint. POST the JSON you already email/log, e.g.:
-
-    {
-      "model_call": "Up",
-      "confidence": 0.72,
-      "regime_pass": true,
-      "features": {...}
-    }
-
-    Env knobs:
-      TRADE_MODE = "EQUITY" (default) or "OPTIONS"
-      ALPACA_API_KEY / ALPACA_SECRET_KEY must be set in Render.
+    Purpose:
+      - Central place your cron (or you) can hit AFTER /predict.
+      - Emits a normalized JSON payload for your trading webhook.
+      - Optionally can place a tiny 1-share SPY paper order as a "proof" path (toggle in Actions).
     """
-    # Optional bearer protection
     if API_TOKEN:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "Missing Bearer token")
         if authorization.split(" ",1)[1] != API_TOKEN:
             raise HTTPException(403, "Invalid token")
 
-    if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
-        raise HTTPException(400, "Alpaca keys missing in environment.")
+    try:
+        payload = {
+            "ts": pd.Timestamp.utcnow().isoformat(),
+            "source": "preopen-trade-endpoint",
+            "model_call": body.model_call,
+            "confidence": body.confidence,
+            "features": body.features,
+            "regime": body.regime,
+            "regime_pass": body.regime_pass,
+        }
 
-    model = str(payload.get("model_call", "")).strip()
-    conf = float(payload.get("confidence", 0.0))
-    regime_pass = bool(payload.get("regime_pass", True))  # allow external policy
+        # This endpoint itself doesn’t place options orders directly (we keep that in the GitHub Action via webhook),
+        # but we return a clean payload so your workflow (Zapier/Make/Cloud Function) can place an OPTIONS spread.
+        return {"ok": True, "ready_for_webhook": True, "payload": payload}
 
-    if model not in ("Up", "Down"):
-        return {"status": "skipped", "reason": "Sideways or unknown model", "received": payload}
-    if conf < 0.60:
-        return {"status": "skipped", "reason": "Low confidence", "received": payload}
-    if not regime_pass:
-        return {"status": "skipped", "reason": "Regime filters failed", "received": payload}
-
-    side = "buy" if model == "Up" else "sell"
-
-    # EQUITY path (always available; good smoke test)
-    if TRADE_MODE == "EQUITY":
-        res = _place_equity_order("SPY", side, qty=1)
-        return {"mode": "EQUITY", "order": res}
-
-    # OPTIONS path (best-effort; falls back to equity if no contract found)
-    if TRADE_MODE == "OPTIONS":
-        try:
-            spot = latest_trade("SPY")
-            cp = "call" if side == "buy" else "put"  # simple directional mapping
-            sym = _pick_option_symbol_via_contracts("SPY", cp, spot)
-            if not sym:
-                # fallback to equity if we can't pick a contract
-                res = _place_equity_order("SPY", side, qty=1)
-                return {"mode": "EQUITY_FALLBACK", "reason": "No option contract found", "order": res}
-            res = _place_option_order(sym, "buy" if side == "buy" else "buy")  # opening position
-            return {"mode": "OPTIONS", "contract": sym, "order": res}
-        except Exception as e:
-            res = _place_equity_order("SPY", side, qty=1)
-            return {"mode": "EQUITY_FALLBACK", "error": str(e), "order": res}
-
-    # Unknown mode -> equity as safe fallback
-    res = _place_equity_order("SPY", side, qty=1)
-    return {"mode": "EQUITY_FALLBACK", "reason": "Unknown TRADE_MODE", "order": res}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
