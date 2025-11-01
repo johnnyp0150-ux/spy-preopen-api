@@ -1,4 +1,4 @@
-name: SPY Preopen Trigger (Safe)
+name: SPY Preopen Trigger
 
 on:
   schedule:
@@ -8,51 +8,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  call_api_and_decide:
+  call_api:
     runs-on: ubuntu-latest
     env:
-      API_URL:    https://spy-preopen-api.onrender.com/predict
+      API_URL: https://spy-preopen-api.onrender.com/predict
       HEALTH_URL: https://spy-preopen-api.onrender.com/healthz
 
-      # ===== Safety knobs =====
-      MIN_CONF: "0.60"           # require >= 0.60 confidence
-      ALLOW_SIDEWAYS: "false"    # don't trade if Sideways
-      TRADE_WINDOW_START_PT: "06:35"
-      TRADE_WINDOW_END_PT:   "12:55"
+      # --- policy knobs ---
+      MIN_CONF: "0.60"          # require >= 0.60 confidence
+      ALLOW_SIDEWAYS: "false"   # don't trade if Sideways
 
-      # Daily risk kill switch (reads Alpaca account)
-      MAX_DD_PCT: "-0.010"       # stop if equity change <= -1.00% today
-
-      # Volatility guard
-      VIX_MAX: "25.0"            # skip if ^VIX >= 25
-
-      # Daily entry cap (count filled BUY option orders tagged today)
-      DAILY_ENTRY_CAP: "2"
-
-      # Cool-down after stopout (minutes) – blocks new entries
-      COOLDOWN_MIN: "30"
-
-      # Position sizing hint for your webhook (not enforced here)
-      SIZE_CAP_PCT: "0.01"       # suggest ≤1% of account equity in premium
-
-      # Logging webhook (optional; leave empty to disable)
-      TRADE_LOG_WEBHOOK_URL: ${{ secrets.TRADE_LOG_WEBHOOK_URL }}
-
-      # Trade webhook (optional; leave empty to disable)
-      TRADE_WEBHOOK_URL: ${{ secrets.TRADE_WEBHOOK_URL }}
-
-      # Alpaca endpoints
-      ALPACA_TRADING: https://paper-api.alpaca.markets
-      ALPACA_DATA:    https://data.alpaca.markets
-      CLIENT_TAG:     "SPYBOT"  # used in client_order_id for traceability
+      # --- logging & actions ---
+      TRADE_WEBHOOK_URL: ${{ secrets.TRADE_WEBHOOK_URL }}           # optional action webhook (Zapier/Make/etc.)
+      TRADE_LOG_WEBHOOK_URL: ${{ secrets.TRADE_LOG_WEBHOOK_URL }}   # Google Apps Script Sheet logger
 
     steps:
-      - name: Install jq & python-dateutil
-        run: |
-          sudo apt-get update && sudo apt-get install -y jq
-          python3 -m pip install --quiet python-dateutil
+      - name: Install jq (JSON)
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      # ---------- Warm the API (avoid cold-start delays) ----------
+      # Warm Render to avoid cold-start delays
       - name: Warm Render app
         id: warm
         shell: bash
@@ -70,15 +44,16 @@ jobs:
           done
           echo "warm_ok=false" >> "$GITHUB_OUTPUT"
 
-      # ---------- Pull model call ----------
       - name: Call SPY API (with retries)
         id: call
         shell: bash
         run: |
           set -euo pipefail
+          echo "Pinging $API_URL ..."
           RES=""
           for i in {1..5}; do
-            RES=$(curl -sS -m 25 -X POST "$API_URL" -H "Content-Type: application/json" -d '{}') || true
+            RES=$(curl -sS -m 25 -X POST "$API_URL" \
+              -H "Content-Type: application/json" -d '{}') || true
             if echo "$RES" | jq -e 'has("model_call") and has("confidence")' >/dev/null 2>&1; then
               break
             fi
@@ -87,127 +62,47 @@ jobs:
           done
           echo "First 200 chars:"; echo "$RES" | head -c 200; echo
           JSON_MIN=$(echo "$RES" | jq -c . 2>/dev/null || echo '')
-          [ -z "$JSON_MIN" ] && { echo "JSON_MIN empty; failing."; exit 1; }
+          if [ -z "$JSON_MIN" ]; then
+            echo "JSON_MIN empty; failing fast."
+            exit 1
+          fi
           echo "res=$JSON_MIN" >> "$GITHUB_OUTPUT"
 
-      # ---------- Risk & sanity gates BEFORE trading ----------
-      - name: Safety checks (time, VIX, account P&L, caps, cooldown)
-        id: safety
-        env:
-          KEY: ${{ secrets.ALPACA_KEY_ID }}
-          SEC: ${{ secrets.ALPACA_SECRET_KEY }}
+      - name: Prepare subject/body + decision
+        id: prep
         shell: bash
         run: |
-          set -euo pipefail
-
           JSON='${{ steps.call.outputs.res }}'
+          echo "Raw JSON:"; echo "$JSON" | jq .
+
           MODEL=$(echo "$JSON" | jq -r '.model_call // "UNKNOWN"')
           CONF=$(echo "$JSON" | jq -r '.confidence // 0')
+          GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance"')
+          FEAT=$(echo "$JSON" | jq -c '.features // {}')
 
-          # a) Model policy
           MIN_CONF="${MIN_CONF}"
           ALLOW_SIDEWAYS="${ALLOW_SIDEWAYS}"
-          OK_MODEL="true"
-          awk_ok=$(awk -v a="$CONF" -v b="$MIN_CONF" 'BEGIN{print (a>=b)?"1":"0"}')
-          [ "$awk_ok" = "1" ] || OK_MODEL="false"
-          if [ "$ALLOW_SIDEWAYS" = "false" ] && [ "$MODEL" = "Sideways" ]; then
-            OK_MODEL="false"
-          fi
 
-          # b) Trade window (PT)
-          now_pt=$(TZ=America/Los_Angeles date +%H:%M)
-          TW_S="${TRADE_WINDOW_START_PT}"
-          TW_E="${TRADE_WINDOW_END_PT}"
-          in_window="false"
-          [[ "$now_pt" > "$TW_S" && "$now_pt" < "$TW_E" ]] && in_window="true"
-
-          # c) VIX guard (Yahoo Finance quote)
-          VIX=$(curl -s "https://query1.finance.yahoo.com/v7/finance/quote?symbols=%5EVIX" | jq -r '.quoteResponse.result[0].regularMarketPrice // 0')
-          VIX_MAX="${VIX_MAX}"
-          vix_ok=$(awk -v v="$VIX" -v m="$VIX_MAX" 'BEGIN{print (v<=m)?"1":"0"}')
-
-          # d) Account P&L kill-switch
-          TRD="${ALPACA_TRADING}"
-          ACCT=$(curl -sS "$TRD/v2/account" -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
-          EQUITY=$(echo "$ACCT" | jq -r '.equity // "0"')
-          LAST_EQ=$(echo "$ACCT" | jq -r '.last_equity // "0"')
-          DD=0
-          if [ "$EQUITY" != "0" ] && [ "$LAST_EQ" != "0" ]; then
-            DD=$(python3 - "$EQUITY" "$LAST_EQ" <<'PY'
-import sys
-eq, last = map(float, sys.argv[1:3])
-print((eq-last)/last)
-PY
-)
-          fi
-          MAX_DD="${MAX_DD_PCT}"
-          dd_ok=$(python3 - "$DD" "$MAX_DD" <<'PY'
-import sys
-dd=float(sys.argv[1]); lim=float(sys.argv[2])
-print(1 if dd>=lim else 0)
-PY
-)
-
-          # e) Daily entry cap (filled BUY option orders tagged today)
-          ORD=$(curl -sS "$TRD/v2/options/orders?status=all&nested=true" -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
-          BUY_TODAY=$(echo "$ORD" | jq -r --arg tag "${CLIENT_TAG}" '
-            [.[] | select(.side=="buy" and .status=="filled" and (.client_order_id // "") | contains($tag))
-            | select(.filled_at != null and (.filled_at | startswith((now | todateiso8601)[:10])))] | length')
-
-          CAP="${DAILY_ENTRY_CAP}"
-          cap_ok=$(python3 - "$BUY_TODAY" "$CAP" <<'PY'
-import sys
-n=int(sys.argv[1]); cap=int(sys.argv[2])
-print(1 if n<cap else 0)
-PY
-)
-
-          # f) Cool-down after stop sell (HARDSTOP/TRAIL/TIMESTOP/EOD) – 30m default
-          COOLDOWN="${COOLDOWN_MIN}"
-          STOP_SELL_TS=$(echo "$ORD" | jq -r --arg tag "${CLIENT_TAG}" '
-            [.[] | select(.side=="sell" and .status=="filled" and (.client_order_id // "") | contains($tag))
-             | select((.client_order_id | test("HARDSTOP|TRAIL|TIMESTOP"))) | .filled_at]
-             | map(select(.!=null)) | sort | last // empty')
-          cool_ok=1
-          if [ -n "$STOP_SELL_TS" ]; then
-            mins=$(python3 - "$STOP_SELL_TS" "$COOLDOWN" <<'PY'
-import sys,datetime
-from dateutil import parser
-ts=parser.isoparse(sys.argv[1])
-now=datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
-mins=int((now-ts).total_seconds()/60)
-need=int(sys.argv[2])
-print(1 if mins>=need else 0)
-PY
-)
-            cool_ok=$mins
-          fi
-
-          # Decision aggregate
           SHOULD_TRADE="false"
-          if [ "$OK_MODEL" = "true" ] && [ "$in_window" = "true" ] && [ "$vix_ok" = "1" ] && [ "$dd_ok" = "1" ] && [ "$cap_ok" = "1" ] && [ "$cool_ok" = "1" ]; then
-            SHOULD_TRADE="true"
+          if [ "$MODEL" != "UNKNOWN" ]; then
+            CONF_OK=$(awk -v a="$CONF" -v b="$MIN_CONF" 'BEGIN{print (a>=b)?"1":"0"}')
+            SIDEWAYS_OK="1"
+            if [ "$ALLOW_SIDEWAYS" = "false" ] && [ "$MODEL" = "Sideways" ]; then
+              SIDEWAYS_OK="0"
+            fi
+            if [ "$CONF_OK" = "1" ] && [ "$SIDEWAYS_OK" = "1" ]; then
+              SHOULD_TRADE="true"
+            fi
           fi
 
-          # Position-size hint
-          SIZE_CAP_PCT="${SIZE_CAP_PCT}"
-          MAX_PREMIUM=$(python3 - "$EQUITY" "$SIZE_CAP_PCT" <<'PY'
-import sys
-eq=float(sys.argv[1]); pct=float(sys.argv[2])
-print(round(eq*pct, 2))
-PY
-)
-
-          echo "model=$MODEL"           >> "$GITHUB_OUTPUT"
-          echo "conf=$CONF"             >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "conf=$CONF" >> "$GITHUB_OUTPUT"
           echo "should_trade=$SHOULD_TRADE" >> "$GITHUB_OUTPUT"
-          echo "vix=$VIX"               >> "$GITHUB_OUTPUT"
-          echo "dd=$DD"                 >> "$GITHUB_OUTPUT"
-          echo "entries_today=$BUY_TODAY" >> "$GITHUB_OUTPUT"
-          echo "max_premium_usd=$MAX_PREMIUM" >> "$GITHUB_OUTPUT"
+          echo "subject=SPY Pre-Open: $MODEL (conf $CONF)" >> "$GITHUB_OUTPUT"
+          printf "body<<EOF\nDirection: %s\nConfidence: %s\nGuidance: %s\nFeatures: %s\nTime: %s\nEOF\n" \
+            "$MODEL" "$CONF" "$GUID" "$FEAT" "${{ github.run_started_at }}" >> "$GITHUB_OUTPUT"
 
-      # ---------- Email ----------
-      - name: Email me the prediction + gates
+      - name: Email me the prediction
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -218,43 +113,26 @@ PY
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_USERNAME }}
           from: "SPY Bot <${{ secrets.MAIL_USERNAME }}>"
-          subject: SPY Pre-Open: ${{ steps.safety.outputs.model }} (conf ${{ steps.safety.outputs.conf }}) | trade=${{ steps.safety.outputs.should_trade }}
-          body: |
-            Direction:  ${{ steps.safety.outputs.model }}
-            Confidence: ${{ steps.safety.outputs.conf }}
-            ShouldTrade: ${{ steps.safety.outputs.should_trade }}
-            VIX:        ${{ steps.safety.outputs.vix }}
-            DailyDD:    ${{ steps.safety.outputs.dd }}
-            EntriesToday: ${{ steps.safety.outputs.entries_today }}
-            MaxPremiumUSD (hint): ${{ steps.safety.outputs.max_premium_usd }}
-            Time:       ${{ github.run_started_at }}
+          subject: ${{ steps.prep.outputs.subject }}
+          body: ${{ steps.prep.outputs.body }}
 
-      # ---------- Optional: call your trade webhook ----------
-      - name: (Optional) Fire trade webhook if policy passes
-        if: ${{ steps.safety.outputs.should_trade == 'true' && env.TRADE_WEBHOOK_URL != '' }}
+      # Always log the raw JSON to your Google Sheet webhook
+      - name: Log to Google Sheet
+        if: ${{ env.TRADE_LOG_WEBHOOK_URL != '' }}
+        shell: bash
+        run: |
+          JSON='${{ steps.call.outputs.res }}'
+          # Add a 'source' hint so the Sheet can record how it arrived
+          URL="${TRADE_LOG_WEBHOOK_URL}?source=preopen-cron"
+          curl -sS -X POST "$URL" -H "Content-Type: application/json" -d "$JSON" \
+            | sed -e 's/./&/200' -e 'q'
+
+      # (Optional) Fire a separate "action webhook" if policy passes (Zapier/Make/etc.)
+      - name: (Optional) Trigger trade webhook (policy passed)
+        if: ${{ steps.prep.outputs.should_trade == 'true' && env.TRADE_WEBHOOK_URL != '' }}
         shell: bash
         run: |
           JSON='${{ steps.call.outputs.res }}'
           curl -sS -X POST "$TRADE_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --argjson model "$JSON" \
-                    --arg dir "${{ steps.safety.outputs.model }}" \
-                    --arg conf "${{ steps.safety.outputs.conf }}" \
-                    --arg maxprem "${{ steps.safety.outputs.max_premium_usd }}" \
-                    '{signal:$model, direction:$dir, confidence:$conf, max_premium_usd:$maxprem, client_tag:"SPYBOT"}')" | sed -e 's/./&/160' -e 'q'
-
-      # ---------- Optional: log run to webhook ----------
-      - name: (Optional) Log to webhook
-        if: ${{ env.TRADE_LOG_WEBHOOK_URL != '' }}
-        shell: bash
-        run: |
-          curl -sS -X POST "$TRADE_LOG_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-                  --arg should '${{ steps.safety.outputs.should_trade }}' \
-                  --arg model  '${{ steps.safety.outputs.model }}' \
-                  --arg conf   '${{ steps.safety.outputs.conf }}' \
-                  --arg vix    '${{ steps.safety.outputs.vix }}' \
-                  --arg dd     '${{ steps.safety.outputs.dd }}' \
-                  --arg entries '${{ steps.safety.outputs.entries_today }}' \
-                  '{event:"preopen", should_trade:$should, model:$model, conf:$conf, vix:$vix, dd:$dd, entries_today:$entries}')"
+            -d "$JSON" | sed -e 's/./&/120' -e 'q'
