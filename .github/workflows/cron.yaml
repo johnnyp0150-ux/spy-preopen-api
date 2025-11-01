@@ -2,8 +2,7 @@ name: SPY Preopen Trigger
 
 on:
   schedule:
-    # 6:23 AM Pacific DURING Daylight Saving Time (UTC-7)
-    # After clocks fall back (Standard Time, UTC-8), change '23 13' -> '23 14'
+    # 6:23 AM Pacific during DST (UTC-7). After clocks fall back, change to '23 14'.
     - cron: '23 13 * * 1-5'
   workflow_dispatch:
 
@@ -12,80 +11,61 @@ jobs:
     runs-on: ubuntu-latest
     env:
       API_URL: https://spy-preopen-api.onrender.com/predict
+      TRADE_URL: https://spy-preopen-api.onrender.com/trade
       HEALTH_URL: https://spy-preopen-api.onrender.com/healthz
 
-      # --- policy knobs ---
-      MIN_CONF: "0.60"          # require >= 0.60 confidence
-      ALLOW_SIDEWAYS: "false"   # don't trade if Sideways
+      # policy knobs
+      MIN_CONF: "0.60"
+      ALLOW_SIDEWAYS: "false"
 
-      # --- Google Apps Script logging (paste your deployed URL in repo secret SHEET_WEBHOOK_URL) ---
-      SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
+      # webhooks
+      SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }} # your Apps Script "deploy as web app" URL
 
-      # --- optional trading webhook that actually places the OPTIONS spread for you ---
-      TRADE_WEBHOOK_URL: ${{ secrets.TRADE_WEBHOOK_URL }}
-
-      # --- tiny proof-of-trade (1 share SPY equity) – set to true to test end-to-end on Alpaca paper ---
-      ENABLE_ALPACA_EQUITY_PROOF: "false"
-      ALPACA_BASE: https://paper-api.alpaca.markets
+      # auth for API (optional)
+      API_BEARER: ${{ secrets.API_TOKEN }} # mirror value you added in Render (optional)
 
     steps:
       - name: Install jq (JSON)
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Warm Render app
-        id: warm
-        shell: bash
         run: |
-          set -euo pipefail
-          echo "Warming $HEALTH_URL ..."
           for i in {1..6}; do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
-            echo "Attempt $i -> HTTP $CODE"
-            if [ "$CODE" = "200" ]; then
-              echo "warm_ok=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
+            echo "healthz -> $code"
+            [ "$code" = "200" ] && break
             sleep 10
           done
-          echo "warm_ok=false" >> "$GITHUB_OUTPUT"
 
       - name: Call SPY API (with retries)
         id: call
         shell: bash
         run: |
           set -euo pipefail
-          echo "Pinging $API_URL ..."
+          HDR=""
+          if [ -n "${API_BEARER:-}" ]; then
+            HDR="-H 'Authorization: Bearer ${API_BEARER}'"
+          fi
           RES=""
           for i in {1..5}; do
-            RES=$(curl -sS -m 25 -X POST "$API_URL" -H "Content-Type: application/json" -d '{}') || true
-            if echo "$RES" | jq -e 'has("model_call") and has("confidence")' >/dev/null 2>&1; then
-              break
-            fi
+            RES=$(bash -lc "curl -sS -m 25 -X POST \"$API_URL\" -H 'Content-Type: application/json' $HDR -d '{}'") || true
+            echo "$RES" | jq -e 'has("model_call") and has("confidence")' >/dev/null 2>&1 && break
             echo "Attempt $i not JSON (or missing fields). Sleeping 6s…"
             sleep 6
           done
-          echo "First 200 chars:"; echo "$RES" | head -c 200; echo
-
-          JSON_MIN=$(echo "$RES" | jq -c . 2>/dev/null || echo '')
-          if [ -z "$JSON_MIN" ]; then
-            echo "JSON_MIN empty; failing fast."
-            exit 1
-          fi
-          echo "res=$JSON_MIN" >> "$GITHUB_OUTPUT"
+          echo "res=$(echo "$RES" | jq -c .)" >> "$GITHUB_OUTPUT"
 
       - name: Prepare subject/body + decision
         id: prep
         shell: bash
         run: |
           JSON='${{ steps.call.outputs.res }}'
-          echo "Raw JSON:"; echo "$JSON" | jq .
-
+          echo "$JSON" | jq .
           MODEL=$(echo "$JSON" | jq -r '.model_call // "UNKNOWN"')
           CONF=$(echo "$JSON" | jq -r '.confidence // 0')
           GUID=$(echo "$JSON" | jq -r '.guidance // "No guidance"')
           FEAT=$(echo "$JSON" | jq -c '.features // {}')
-          REGI=$(echo "$JSON" | jq -c '.regime // {}')
-          REGP=$(echo "$JSON" | jq -r '.regime_pass // false')
+          REGPASS=$(echo "$JSON" | jq -r '.regime_pass // false')
 
           MIN_CONF="${MIN_CONF}"
           ALLOW_SIDEWAYS="${ALLOW_SIDEWAYS}"
@@ -93,22 +73,16 @@ jobs:
           SHOULD_TRADE="false"
           if [ "$MODEL" != "UNKNOWN" ]; then
             CONF_OK=$(awk -v a="$CONF" -v b="$MIN_CONF" 'BEGIN{print (a>=b)?"1":"0"}')
-            SIDEWAYS_OK="1"
-            if [ "$ALLOW_SIDEWAYS" = "false" ] && [ "$MODEL" = "Sideways" ]; then
-              SIDEWAYS_OK="0"
-            fi
-            if [ "$CONF_OK" = "1" ] && [ "$SIDEWAYS_OK" = "1" ] && [ "$REGP" = "true" ]; then
-              SHOULD_TRADE="true"
-            fi
+            SIDEWAYS_OK="1"; [ "$ALLOW_SIDEWAYS" = "false" ] && [ "$MODEL" = "Sideways" ] && SIDEWAYS_OK="0"
+            [ "$CONF_OK" = "1" ] && [ "$SIDEWAYS_OK" = "1" ] && [ "$REGPASS" = "true" ] && SHOULD_TRADE="true"
           fi
 
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
           echo "conf=$CONF" >> "$GITHUB_OUTPUT"
           echo "should_trade=$SHOULD_TRADE" >> "$GITHUB_OUTPUT"
-          echo "regime=$REGI" >> "$GITHUB_OUTPUT"
           echo "subject=SPY Pre-Open: $MODEL (conf $CONF)" >> "$GITHUB_OUTPUT"
-          printf "body<<EOF\nDirection: %s\nConfidence: %s\nGuidance: %s\nRegime: %s\nFeatures: %s\nTime: %s\nEOF\n" \
-            "$MODEL" "$CONF" "$GUID" "$REGI" "$FEAT" "${{ github.run_started_at }}" >> "$GITHUB_OUTPUT"
+          printf "body<<EOF\nDirection: %s\nConfidence: %s\nGuidance: %s\nFeatures: %s\nTime: %s\nEOF\n" \
+            "$MODEL" "$CONF" "$GUID" "$FEAT" "${{ github.run_started_at }}" >> "$GITHUB_OUTPUT"
 
       - name: Email me the prediction
         if: always()
@@ -128,34 +102,21 @@ jobs:
         if: ${{ env.SHEET_WEBHOOK_URL != '' }}
         shell: bash
         run: |
-          JSON='${{ steps.call.outputs.res }}'
-          SRC='{"source":"preopen-cron"}'
-          MERGED=$(jq -c -s '.[0] * .[1]' <(echo "$JSON") <(echo "$SRC"))
-          curl -sS -X POST "${{ env.SHEET_WEBHOOK_URL }}" \
-            -H "Content-Type: application/json" -d "$MERGED" | head -c 200; echo
+          curl -sS -X POST "$SHEET_WEBHOOK_URL" -H "Content-Type: application/json" \
+            -d '{"source":"preopen-cron","row":'${{ steps.call.outputs.res }}'}' | sed -e 's/./&/160' -e 'q'
 
-      - name: (Optional) Trigger trade webhook (policy passed)
-        if: ${{ steps.prep.outputs.should_trade == 'true' && env.TRADE_WEBHOOK_URL != '' }}
+      - name: Place trade via /trade (only if policy passes)
+        if: ${{ steps.prep.outputs.should_trade == 'true' }}
         shell: bash
         run: |
-          JSON='${{ steps.call.outputs.res }}'
-          curl -sS -X POST "$TRADE_WEBHOOK_URL" -H "Content-Type: application/json" -d "$JSON" | head -c 200; echo
-
-      - name: (Optional) Place 1-share SPY paper trade (equity proof)
-        if: ${{ steps.prep.outputs.should_trade == 'true' && env.ENABLE_ALPACA_EQUITY_PROOF == 'true' }}
-        shell: bash
-        env:
-          APCA_KEY_ID:     ${{ secrets.ALPACA_KEY_ID }}
-          APCA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: |
-          set -euo pipefail
-          MODEL='${{ steps.prep.outputs.model }}'
-          SIDE="buy"
-          if [ "$MODEL" = "Down" ]; then SIDE="sell"; fi
-          echo "Placing $SIDE 1 share SPY (paper proof)..."
-          curl -sS -X POST "$ALPACA_BASE/v2/orders" \
-            -H "APCA-API-KEY-ID: $APCA_KEY_ID" \
-            -H "APCA-API-SECRET-KEY: $APCA_SECRET_KEY" \
-            -H "Content-Type: application/json" \
-            -d '{"symbol":"SPY","qty":"1","side":"'"$SIDE"'","type":"market","time_in_force":"day"}' \
-            | head -c 300; echo
+          HDR=""
+          if [ -n "${API_BEARER:-}" ]; then
+            HDR="-H 'Authorization: Bearer ${API_BEARER}'"
+          fi
+          BODY=$(jq -n \
+            --arg model "${{ steps.prep.outputs.model }}" \
+            --argjson conf ${{
+              steps.prep.outputs.conf
+            }} \
+            --argjson regpass true '{model_call:$model, confidence:$conf, regime_pass:$regpass}')
+          bash -lc "curl -sS -X POST \"$TRADE_URL\" -H 'Content-Type: application/json' $HDR -d \"$BODY\"" | sed -e 's/./&/200' -e 'q'
