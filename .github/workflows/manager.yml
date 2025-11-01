@@ -1,4 +1,4 @@
-name: SPY Exit Manager
+name: SPY Exit Manager (Safe)
 
 on:
   schedule:
@@ -14,39 +14,40 @@ jobs:
       ALPACA_DATA:    https://data.alpaca.markets
       CLIENT_TAG: "SPYBOT"
 
-      # Existing exits
+      # Exits
       TAKE_PARTIAL_PCT: "0.30"   # +30% → sell half
       FAST_TP_PCT: "0.15"        # +15% by TIME_STOP_MIN or exit
       TIME_STOP_MIN: "45"        # minutes since first fill
 
-      # NEW seatbelts
       HARD_STOP_PCT: "-0.30"     # full exit ≤ -30%
       TRAIL_ARM_PCT: "0.50"      # arm trailing once peak ≥ +50%
       TRAIL_GIVEBACK: "0.20"     # exit if current ≤ (peak − 20%)
       EOD_FLAT_PT: "12:55"       # flat all at 12:55 PT
 
-    steps:
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      # Optional logging webhook
+      TRADE_LOG_WEBHOOK_URL: ${{ secrets.TRADE_LOG_WEBHOOK_URL }}
 
-      - name: Manage
+    steps:
+      - name: Install jq & dateutil
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
+          python3 -m pip install --quiet python-dateutil
+
+      - name: Manage exits
         env:
           KEY: ${{ secrets.ALPACA_KEY_ID }}
           SEC: ${{ secrets.ALPACA_SECRET_KEY }}
+        shell: bash
         run: |
           set -euo pipefail
-          TRD="${{ env.ALPACA_TRADING }}"; DATA="${{ env.ALPACA_DATA }}"
+          TRD="${ALPACA_TRADING}"; DATA="${ALPACA_DATA}"
           now_pt=$(TZ=America/Los_Angeles date +%H:%M)
 
-          # 1) Option positions
           POS=$(curl -sS "$TRD/v2/options/positions" \
                  -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" || true)
-          ok=$(echo "$POS" | jq 'type=="array"')
-          [ "$ok" != "true" ] && { echo "options positions endpoint unavailable or none"; exit 0; }
+          [ "$(echo "$POS" | jq 'type=="array"')" != "true" ] && { echo "no option positions"; exit 0; }
           N=$(echo "$POS" | jq 'length')
-          [ "$N" -eq 0 ] && { echo "no open option positions"; exit 0; }
-
-          echo "positions: $N"
+          [ "$N" -eq 0 ] && { echo "no option positions"; exit 0; }
 
           for i in $(seq 0 $((N-1))); do
             P=$(echo "$POS" | jq ".[$i]")
@@ -54,28 +55,39 @@ jobs:
             QTY=$(echo "$P" | jq -r '.qty | tonumber')
             ENTRY=$(echo "$P" | jq -r '.avg_entry_price | tonumber')
 
-            # Latest quote + daily high for trailing
             SNAP=$(curl -sS "$DATA/v1beta1/options/snapshots?symbols=$SYM" \
                      -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" || true)
             bp=$(echo "$SNAP" | jq -r ".snapshots.\"$SYM\".latestQuote.bp // empty")
             ap=$(echo "$SNAP" | jq -r ".snapshots.\"$SYM\".latestQuote.ap // empty")
             dayH=$(echo "$SNAP" | jq -r ".snapshots.\"$SYM\".dailyBar.h // empty")
-            [ -z "$bp" -o -z "$ap" -o "$bp" = "null" -o "$ap" = "null" ] && { echo "no quote for $SYM"; continue; }
+            qts=$(echo "$SNAP" | jq -r ".snapshots.\"$SYM\".latestQuote.t // empty")
 
-            MID=$(python3 - <<PY
+            # Stale-data guard: require a recent quote (<=10s old)
+            fresh=1
+            if [ -n "$qts" ] && [ "$qts" != "null" ]; then
+              fresh=$(python3 - "$qts" <<'PY'
+import sys,datetime
+from dateutil import parser
+t=parser.isoparse(sys.argv[1])
+now=datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+print(1 if (now-t).total_seconds() <= 10 else 0)
+PY
+)
+            fi
+            [ "$fresh" -eq 1 ] || { echo "stale quote for $SYM"; continue; }
+            [ -n "$bp" ] && [ -n "$ap" ] && [ "$bp" != "null" ] && [ "$ap" != "null" ] || { echo "no quote for $SYM"; continue; }
+
+            MID=$(python3 - "$bp" "$ap" <<'PY'
 import sys; print((float(sys.argv[1])+float(sys.argv[2]))/2.0)
 PY
- "$bp" "$ap")
-
-            # Current and peak (from daily high) % returns
-            RET=$(python3 - <<PY
+)
+            RET=$(python3 - "$MID" "$ENTRY" <<'PY'
 import sys
 mid=float(sys.argv[1]); entry=float(sys.argv[2])
 print((mid-entry)/entry)
 PY
- "$MID" "$ENTRY")
-
-            PEAK_RET=$(python3 - <<PY
+)
+            PEAK_RET=$(python3 - "$dayH" "$ENTRY" <<'PY'
 import sys
 h=sys.argv[1]
 if h in ("", "null"): 
@@ -83,88 +95,78 @@ if h in ("", "null"):
 else:
     print( (float(h)-float(sys.argv[2]))/float(sys.argv[2]) )
 PY
- "$dayH" "$ENTRY")
+)
 
-            echo "$SYM qty=$QTY entry=$ENTRY mid=$MID ret=$RET peak=$PEAK_RET"
-
-            # Fetch orders for this symbol today (to detect partial already, fill time)
             ORD=$(curl -sS "$TRD/v2/options/orders?status=all&symbols=$SYM&nested=true" \
                      -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC")
-            # first fill time
-            FILL_TS=$(echo "$ORD" | jq -r --arg tag "${{ env.CLIENT_TAG }}" \
+            FILL_TS=$(echo "$ORD" | jq -r --arg tag "${CLIENT_TAG}" \
                        '[.[] | select(.client_order_id | contains($tag)) | .filled_at] | map(select(.!=null)) | sort | .[0]')
             AGE_MIN=9999
             if [ "$FILL_TS" != "null" ] && [ -n "$FILL_TS" ]; then
-              AGE_MIN=$(python3 - <<PY
+              AGE_MIN=$(python3 - "$FILL_TS" <<'PY'
 import sys,datetime
 from dateutil import parser
 t=parser.isoparse(sys.argv[1])
 now=datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
 print(int((now-t).total_seconds()/60))
 PY
- "$FILL_TS")
+)
             fi
-
-            SOLD_TODAY=$(echo "$ORD" | jq -r --arg tag "${{ env.CLIENT_TAG }}" \
+            SOLD_TODAY=$(echo "$ORD" | jq -r --arg tag "${CLIENT_TAG}" \
                        '[.[] | select(.client_order_id | contains($tag) and .side=="sell" and .status=="filled")] | length')
 
             sell_ioc () {
               local qty="$1"; local reason="$2"
               echo "SELL IOC $qty $SYM ($reason)"
-              curl -sS -X POST "$TRD/v2/options/orders" \
-                -H "APCA-API-KEY-ID: $KEY" -H "APCA-API-SECRET-KEY: $SEC" -H "Content-Type: application/json" \
+              RES=$(curl -sS -X POST "$TRD/v2/options/orders" \
+                -H "APCA-API-KEY-ID: $KEY" \
+                -H "APCA-API-SECRET-KEY: $SEC" \
+                -H "Content-Type: application/json" \
                 -d "$(jq -n --arg sym "$SYM" --arg qty "$qty" \
-                      --arg cid "${{ env.CLIENT_TAG }}-${reason}-$(date +%H%M%S)" \
-                      '{symbol:$sym, qty:$qty, side:"sell", type:"market", time_in_force:"ioc", client_order_id:$cid}')" \
-                | jq -r '.status'
+                      --arg cid "${CLIENT_TAG}-${reason}-$(date +%H%M%S)" \
+                      '{symbol:$sym, qty:$qty, side:"sell", type:"market", time_in_force:"ioc", client_order_id:$cid}')" )
+              echo "$RES" | jq -r '.status // .message // .code'
+              if [ -n "${{ env.TRADE_LOG_WEBHOOK_URL }}" ]; then
+                curl -sS -X POST "${{ env.TRADE_LOG_WEBHOOK_URL }}" \
+                  -H "Content-Type: application/json" \
+                  -d "$(jq -n --arg ts "$(TZ=America/Los_Angeles date -Iseconds)" \
+                          --arg sym "$SYM" --arg qty "$qty" --arg reason "$reason" \
+                          --arg mid "$MID" --arg ret "$RET" --arg peak "$PEAK_RET" \
+                          '{event:"exit", t:$ts, symbol:$sym, qty:$qty, reason:$reason, mid:$mid, ret:$ret, peak:$peak}')" >/dev/null || true
+              fi
             }
 
-            # --- A) Hard stop ---
-            if python3 - <<PY
+            # A) Hard stop
+            if python3 - "$RET" "${HARD_STOP_PCT}" <<'PY'
 import sys; print(int(float(sys.argv[1]) <= float(sys.argv[2])))
 PY
- "$RET" "${{ env.HARD_STOP_PCT }}"
-            then
-              sell_ioc "$QTY" "HARDSTOP"; continue
-            fi
+            then sell_ioc "$QTY" "HARDSTOP"; continue; fi
 
-            # --- B) Partial at +30% (once) ---
-            if python3 - <<PY
+            # B) Partial at +30% (once)
+            if python3 - "$RET" "${TAKE_PARTIAL_PCT}" "$SOLD_TODAY" "$QTY" <<'PY'
 import sys
 ret=float(sys.argv[1]); tp=float(sys.argv[2]); sold=int(sys.argv[3]); qty=int(sys.argv[4])
 print( int(ret>=tp and sold==0 and qty>=2) )
 PY
- "$RET" "${{ env.TAKE_PARTIAL_PCT }}" "$SOLD_TODAY" "$QTY"
-            then
-              sell_ioc "$(( QTY/2 ))" "PARTIAL"; continue
-            fi
+            then sell_ioc "$(( QTY/2 ))" "PARTIAL"; continue; fi
 
-            # --- C) Time stop: not +15% by TIME_STOP_MIN ---
-            if python3 - <<PY
+            # C) Time stop: not +15% by TIME_STOP_MIN
+            if python3 - "$AGE_MIN" "$RET" "${FAST_TP_PCT}" "${TIME_STOP_MIN}" <<'PY'
 import sys
-age=int(sys.argv[1]); ret=float(sys.argv[2]); fast=float(sys.argv[3])
-print( int(age>=${{ env.TIME_STOP_MIN }} and ret<fast) )
+age=int(sys.argv[1]); ret=float(sys.argv[2]); fast=float(sys.argv[3]); need=int(sys.argv[4])
+print( int(age>=need and ret<fast) )
 PY
- "$AGE_MIN" "$RET" "${{ env.FAST_TP_PCT }}"
-            then
-              sell_ioc "$QTY" "TIMESTOP"; continue
-            fi
+            then sell_ioc "$QTY" "TIMESTOP"; continue; fi
 
-            # --- D) Trailing winner (based on option daily high) ---
-            if python3 - <<PY
+            # D) Trailing winner (arm ≥ +50%, exit at 20% giveback)
+            if python3 - "$PEAK_RET" "${TRAIL_ARM_PCT}" "$RET" "${TRAIL_GIVEBACK}" <<'PY'
 import sys
 peak=float(sys.argv[1]); arm=float(sys.argv[2]); ret=float(sys.argv[3]); give=float(sys.argv[4])
-# Arm once peak >= arm; exit if current <= peak - giveback
 print( int( (peak>=arm) and (ret <= (peak - give)) ) )
 PY
- "$PEAK_RET" "${{ env.TRAIL_ARM_PCT }}" "$RET" "${{ env.TRAIL_GIVEBACK }}"
-            then
-              sell_ioc "$QTY" "TRAIL"; continue
-            fi
+            then sell_ioc "$QTY" "TRAIL"; continue; fi
 
-            # --- E) End-of-day flat ---
-            if [ "$now_pt" \> "${{ env.EOD_FLAT_PT }}" ]; then
-              sell_ioc "$QTY" "EOD"; continue
-            fi
+            # E) End-of-day flat
+            if [ "$now_pt" \> "${EOD_FLAT_PT}" ]; then sell_ioc "$QTY" "EOD"; continue; fi
 
           done
